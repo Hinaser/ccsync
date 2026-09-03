@@ -4,6 +4,9 @@
 # Dependencies: a POSIX shell, awk, tar, and the tailscale CLI. Nothing else.
 set -u
 
+# Received bundles carry transcripts: keep everything this script writes private.
+umask 077
+
 SELF_DIR=${0%/*}
 [ "$SELF_DIR" = "$0" ] && SELF_DIR=.
 VERSION=$(awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' \
@@ -19,6 +22,8 @@ ARCHIVE=$STATE/archive
 CONFLICTS=$STATE/conflicts
 OUTBOX=$STATE/outbox
 MAX_HISTORY_KB=65536
+MAX_BUNDLE_KB=65536       # refuse an incoming bundle larger than this
+MAX_UNPACKED_KB=262144    # and one that expands past this
 
 QUIET=0
 AUTO=0
@@ -91,6 +96,18 @@ arg_path() {
 
 # ---------------------------------------------------------------- primitives
 
+# A manifest field that becomes a path component or a filename. Rejecting '/'
+# and '..' outright is what keeps a peer from steering rm -rf or a transcript
+# write outside the directory we mean to touch.
+safe_component() { # value
+    case ${1:-} in
+        ''|.|..)            return 1 ;;
+        -*)                 return 1 ;;
+        *[!A-Za-z0-9._-]*)  return 1 ;;
+    esac
+    return 0
+}
+
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
@@ -136,7 +153,11 @@ abs_path() {
 #   path  <host> <local-cwd> <remote-cwd>
 #   host  <host> <field> <value>
 
-map_init() { mkdir -p "$STATE"; [ -f "$MAP" ] || : > "$MAP"; }
+# State holds transcripts and received bundles: 0700 even on an install that
+# predates the umask above.
+private_dir() { mkdir -p "$1" && chmod 700 "$1" 2>/dev/null || :; }
+
+map_init() { private_dir "$STATE"; [ -f "$MAP" ] || : > "$MAP"; }
 
 map_set() { # kind key... value  (replaces any record with the same leading fields)
     map_init
@@ -279,7 +300,7 @@ win_temp_dir() {
 staging_dir() {
     find_tailscale
     if [ "$TS_CROSS" = 0 ]; then
-        mkdir -p "$OUTBOX"; printf '%s' "$OUTBOX"; return 0
+        private_dir "$OUTBOX"; printf '%s' "$OUTBOX"; return 0
     fi
     _cached=$(map_get local win_staging 2>/dev/null)
     if [ -n "$_cached" ] && [ -d "$_cached" ]; then printf '%s' "$_cached"; return 0; fi
@@ -625,7 +646,7 @@ cmd_pull() {
         esac
     done
 
-    mkdir -p "$ARCHIVE"
+    private_dir "$STATE"; private_dir "$ARCHIVE"
     if [ -n "$_source" ]; then
         _stg=$_source
     else
@@ -648,14 +669,24 @@ cmd_pull() {
     _deferred=0; _conflicted=0
     printf '%s\n' "$_list" | while IFS= read -r b; do
         [ -n "$b" ] || continue
+        _kb=$(du -k "$b" 2>/dev/null | awk '{print $1; exit}')
+        if [ -n "$_kb" ] && [ "$_kb" -gt "$MAX_BUNDLE_KB" ]; then
+            warn "  reject $(basename "$b"): ${_kb} KB, over the ${MAX_BUNDLE_KB} KB limit"
+            reject_bundle "$b"; continue
+        fi
         _w=$(mktemp -d) || die "mktemp failed"
         if ! tar -xzf "$b" -C "$_w" 2>/dev/null; then
-            warn "  skip $(basename "$b"): not a readable bundle"
-            rm -rf "$_w"; _deferred=$((_deferred + 1)); continue
+            warn "  reject $(basename "$b"): not a readable bundle"
+            rm -rf "$_w"; reject_bundle "$b"; continue
+        fi
+        _uk=$(du -sk "$_w" 2>/dev/null | awk '{print $1; exit}')
+        if [ -n "$_uk" ] && [ "$_uk" -gt "$MAX_UNPACKED_KB" ]; then
+            warn "  reject $(basename "$b"): expands to ${_uk} KB, over the ${MAX_UNPACKED_KB} KB limit"
+            rm -rf "$_w"; reject_bundle "$b"; continue
         fi
         [ -f "$_w/manifest" ] || {
-            warn "  skip $(basename "$b"): no manifest"
-            rm -rf "$_w"; _deferred=$((_deferred + 1)); continue
+            warn "  reject $(basename "$b"): no manifest"
+            rm -rf "$_w"; reject_bundle "$b"; continue
         }
         _kind=$(mf_get "$_w/manifest" kind)
         _ok=0
@@ -667,18 +698,27 @@ cmd_pull() {
                          0) _ok=1 ;;
                          2) _ok=2 ;;
                      esac ;;
-            *) warn "  skip $(basename "$b"): unknown bundle kind '$_kind'" ;;
+            *) warn "  reject $(basename "$b"): unknown bundle kind '$_kind'"; _ok=3 ;;
         esac
         rm -rf "$_w"
         case $_ok in
             1) mv "$b" "$ARCHIVE/" 2>/dev/null || rm -f "$b" ;;
-            2) mkdir -p "$CONFLICTS"
+            2) private_dir "$CONFLICTS"
                mv "$b" "$CONFLICTS/" 2>/dev/null
                warn "        set aside in $CONFLICTS (it will not be retried)" ;;
+            3) reject_bundle "$b" ;;
             *) say "  left queued in $_stg" ;;
         esac
     done
     return 0
+}
+
+# A bundle we will never be able to read. Move it out of the inbox so the
+# SessionStart hook does not retry it on every session for the rest of time.
+reject_bundle() { # path
+    private_dir "$CONFLICTS"
+    mv "$1" "$CONFLICTS/" 2>/dev/null || rm -f "$1"
+    warn "        set aside in $CONFLICTS (it will not be retried)"
 }
 
 list_bundles() {
@@ -693,6 +733,7 @@ handle_probe() {
     _origin=$(mf_get "$_mf" origin_host)
     _claimed=$(mf_get "$_mf" claimed_remote_cwd)
     _theirs=$(mf_get "$_mf" origin_cwd)
+    safe_component "$_origin" || { warn "  skip probe: unusable origin host"; return 1; }
     _exists=no; [ -d "$_claimed" ] && _exists=yes
 
     map_set path "$_origin" "$_claimed" "$_theirs"
@@ -731,6 +772,7 @@ handle_probe() {
 handle_ack() {
     _mf=$1
     _host=$(mf_get "$_mf" origin_host)
+    safe_component "$_host" || { warn "  skip ack: unusable origin host"; return 1; }
     map_set host "$_host" verified "$(now_iso)"
     map_set host "$_host" claude_version "$(mf_get "$_mf" claude_version)"
     if [ "$(mf_get "$_mf" path_exists)" = yes ]; then _m=OK; else _m="PATH MISSING"; fi
@@ -745,6 +787,8 @@ handle_session() {
     _origin=$(mf_get "$_mf" origin_host)
     _ocwd=$(mf_get "$_mf" origin_cwd)
     _target=$(mf_get "$_mf" target_cwd)
+    safe_component "$_sid" || { warn "  skip bundle: unusable session id"; return 1; }
+    safe_component "$_origin" || { warn "  skip $_sid: unusable origin host"; return 1; }
 
     if [ -n "$_into" ]; then
         _local=$(abs_path "$_into")
@@ -798,17 +842,35 @@ handle_session() {
                     return 2
                 } ;;
         esac
-        cp "$_dest" "$_dest.bak-$(date '+%s')"
+        _bak=$_dest.bak-$(date '+%s'); _n=0
+        while [ -e "$_bak" ]; do
+            _n=$((_n + 1)); _bak=$_dest.bak-$(date '+%s')-$_n
+        done
+        cp "$_dest" "$_bak"
     fi
 
     mkdir -p "$_dd"
-    set -- $(rewrite_jsonl "$_src" "$_dest" "$_ocwd" "$_local" "$_all")
+    # Build beside the destination and rename over it, so a failure part-way
+    # through cannot leave a truncated transcript where a whole one was.
+    _new=$_dd/.$_sid.jsonl.new.$$
+    _counts=$(rewrite_jsonl "$_src" "$_new" "$_ocwd" "$_local" "$_all") || {
+        rm -f "$_new"; warn "  skip $_sid: could not write transcript"; return 1
+    }
+    mv "$_new" "$_dest" || { rm -f "$_new"; warn "  skip $_sid: could not place transcript"; return 1; }
+    set -- $_counts
     _lines=${1:-0}; _changed=${2:-0}
 
     if [ "$(mf_get "$_mf" file_history)" = 1 ] && [ -d "$_w/file-history/$_sid" ]; then
-        rm -rf "$FILE_HISTORY/$_sid"
-        mkdir -p "$FILE_HISTORY"
-        cp -R "$_w/file-history/$_sid" "$FILE_HISTORY/$_sid"
+        # cp -R keeps symlinks as symlinks; one pointing out of the tree would
+        # become a live path Claude later writes through.
+        if [ -h "$_w/file-history/$_sid" ] ||
+           [ -n "$(find "$_w/file-history/$_sid" -type l -print 2>/dev/null | head -n 1)" ]; then
+            warn "  $_sid: file history not restored, the bundle contains symlinks"
+        else
+            rm -rf "$FILE_HISTORY/$_sid"
+            mkdir -p "$FILE_HISTORY"
+            cp -R "$_w/file-history/$_sid" "$FILE_HISTORY/$_sid"
+        fi
     fi
 
     printf 'pulled %s from %s\n' "$_sid" "$_origin"

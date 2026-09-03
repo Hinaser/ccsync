@@ -38,6 +38,17 @@ able to discard work that exists only on the receiving machine.
 — in that order. Scanning `$HOME` for a plausible directory was tried and
 removed.
 
+**Tailnet peers are trusted; their manifests still get checked.** A device that
+Tailscale has approved into the tailnet is one of your own machines, so ccsync
+does not authenticate `origin_host` or verify that an incoming transcript's
+history is unmodified — a peer can assert both. What it does check is that
+`session_id` and `origin_host` are single path components (`safe_component`),
+because those become filenames, map keys and the argument to `rm -rf`. That is
+not defence against a hostile peer so much as against a buggy or older one: an
+unvalidated `session_id` was a `rm -rf` outside the project, running unattended
+from the SessionStart hook. Any new manifest field that reaches a path needs
+the same check.
+
 ## Naming
 
 | | |
