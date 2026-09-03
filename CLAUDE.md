@@ -16,6 +16,12 @@ not reintroduce an interpreter dependency for convenience.
 loader read `hooks/hooks.json` twice and the plugin fails with "Duplicate hooks
 file detected".
 
+**`${CLAUDE_PLUGIN_ROOT}` must be written with braces.** The loader does a
+literal `${CLAUDE_PLUGIN_ROOT}` → path replacement on command bodies,
+frontmatter and `hooks.json` before anything reaches a shell. Bare
+`$CLAUDE_PLUGIN_ROOT` is not substituted, so the shell expands it to the empty
+string and every command dies with `/bin/ccsync: no such file or directory`.
+
 **`/plugin marketplace add Hinaser/ccsync` tracks the default branch.** There is no `@tag` or `@ref` syntax — that string is treated as a
 repository name. Everyone who installs gets the tip of `main`, so `main` must
 always be in a working state. Tags are version markers for humans, not install

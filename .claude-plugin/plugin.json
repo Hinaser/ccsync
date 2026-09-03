@@ -1,7 +1,7 @@
 {
   "name": "ccsync",
   "description": "Move Claude Code sessions between machines over Tailscale (Taildrop). No sshd, no open ports, no path alignment.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "hinaser"
   },
