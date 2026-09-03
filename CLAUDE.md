@@ -53,6 +53,8 @@ removed.
 2. commit
 3. `git tag -a vX.Y.Z -m "ccsync X.Y.Z" && git push origin vX.Y.Z`
 4. `gh release create vX.Y.Z --notes ...`
+5. refresh this machine's own install: `claude plugin update ccsync@hinaser`,
+   then restart
 
 Releases carry no assets; a plugin is installed from the repository, not
 downloaded. Do not force-update a tag that has been published.
