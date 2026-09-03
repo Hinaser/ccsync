@@ -1,0 +1,830 @@
+#!/bin/sh
+# ccsync - move Claude Code sessions between machines over Tailscale.
+#
+# Dependencies: a POSIX shell, awk, tar, and the tailscale CLI. Nothing else.
+set -u
+
+VERSION=0.1.0
+
+CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+PROJECTS=$CLAUDE_HOME/projects
+FILE_HISTORY=$CLAUDE_HOME/file-history
+STATE=$CLAUDE_HOME/ccsync
+MAP=$STATE/map
+ARCHIVE=$STATE/archive
+CONFLICTS=$STATE/conflicts
+OUTBOX=$STATE/outbox
+MAX_HISTORY_KB=65536
+
+QUIET=0
+AUTO=0
+
+die() {
+    printf 'ccsync: %s\n' "$*" >&2
+    [ "$AUTO" = 1 ] && exit 0
+    exit 1
+}
+say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+
+# ------------------------------------------------------------------ platform
+
+is_wsl() {
+    [ -r /proc/sys/kernel/osrelease ] || return 1
+    case $(cat /proc/sys/kernel/osrelease 2>/dev/null) in
+        *icrosoft*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+IS_WSL=0
+is_wsl && IS_WSL=1
+
+TS_BIN=
+TS_CROSS=0     # a Windows binary driven from WSL: its arguments must be Windows paths
+
+find_tailscale() {
+    [ -n "$TS_BIN" ] && return 0
+    for c in \
+        "${CCSYNC_TAILSCALE:-}" \
+        "$( [ "$IS_WSL" = 1 ] && printf '%s' '/mnt/c/Program Files/Tailscale/tailscale.exe' )" \
+        "$(command -v tailscale 2>/dev/null)" \
+        '/Applications/Tailscale.app/Contents/MacOS/Tailscale' \
+        '/usr/local/bin/tailscale' \
+        '/opt/homebrew/bin/tailscale' \
+        '/usr/bin/tailscale' \
+        '/c/Program Files/Tailscale/tailscale.exe' \
+        'C:/Program Files/Tailscale/tailscale.exe'
+    do
+        [ -n "$c" ] && [ -x "$c" ] && { TS_BIN=$c; break; }
+        [ -n "$c" ] && [ -f "$c" ] && { TS_BIN=$c; break; }
+    done
+    [ -n "$TS_BIN" ] || die "tailscale not found. Install Tailscale; on WSL keep the Windows client (no separate WSL install needed). Override with CCSYNC_TAILSCALE."
+    case $TS_BIN in
+        *.exe) [ "$IS_WSL" = 1 ] && TS_CROSS=1 ;;
+    esac
+    return 0
+}
+
+ts() {
+    find_tailscale
+    if [ "$TS_CROSS" = 1 ]; then
+        ( cd /mnt/c 2>/dev/null || cd /; "$TS_BIN" "$@" )
+    else
+        "$TS_BIN" "$@"
+    fi
+}
+
+# Render a local path the way the tailscale binary expects it.
+arg_path() {
+    if [ "$TS_CROSS" = 1 ]; then
+        wslpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# ---------------------------------------------------------------- primitives
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        printf ''
+    fi
+}
+
+now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+
+# Claude Code's project-directory key: non-alphanumerics become '-'.
+encode_project() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+# Resolve ~/.claude/projects/<key>. Prefer an existing directory matched
+# loosely so we never depend on guessing the exact escaping rule.
+project_dir() {
+    _cwd=$1
+    _direct=$PROJECTS/$(encode_project "$_cwd")
+    if [ -d "$_direct" ]; then printf '%s' "$_direct"; return 0; fi
+    _key=$(printf '%s' "$_cwd" | sed 's/[^A-Za-z0-9]//g' | tr 'A-Z' 'a-z')
+    if [ -d "$PROJECTS" ]; then
+        for d in "$PROJECTS"/*; do
+            [ -d "$d" ] || continue
+            _n=$(basename "$d" | sed 's/[^A-Za-z0-9]//g' | tr 'A-Z' 'a-z')
+            [ "$_n" = "$_key" ] && { printf '%s' "$d"; return 0; }
+        done
+    fi
+    printf '%s' "$_direct"
+}
+
+abs_path() {
+    case $1 in
+        /*|[A-Za-z]:*) printf '%s' "$1" ;;
+        *) ( cd "$1" 2>/dev/null && pwd ) || printf '%s' "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- state file
+# Tab-separated records:
+#   local <key> <value>
+#   path  <host> <local-cwd> <remote-cwd>
+#   host  <host> <field> <value>
+
+map_init() { mkdir -p "$STATE"; [ -f "$MAP" ] || : > "$MAP"; }
+
+map_set() { # kind key... value  (replaces any record with the same leading fields)
+    map_init
+    _n=$#
+    _val=$(eval printf '%s' "\"\${$_n}\"")
+    _keys=
+    _i=1
+    while [ "$_i" -lt "$_n" ]; do
+        _keys=$_keys$(eval printf '%s' "\"\${$_i}\"")$(printf '\t')
+        _i=$((_i + 1))
+    done
+    _tmp=$STATE/.map.$$
+    awk -F'\t' -v k="$_keys" -v n="$((_n - 1))" '
+        { pre = ""; for (i = 1; i <= n; i++) pre = pre $i "\t" }
+        pre != k { print }
+    ' "$MAP" > "$_tmp" 2>/dev/null || : > "$_tmp"
+    printf '%s%s\n' "$_keys" "$_val" >> "$_tmp"
+    mv "$_tmp" "$MAP"
+}
+
+map_get() { # kind key...
+    [ -f "$MAP" ] || return 1
+    _n=$#
+    _keys=
+    _i=1
+    while [ "$_i" -le "$_n" ]; do
+        _keys=$_keys$(eval printf '%s' "\"\${$_i}\"")$(printf '\t')
+        _i=$((_i + 1))
+    done
+    awk -F'\t' -v k="$_keys" -v n="$_n" '
+        { pre = ""; for (i = 1; i <= n; i++) pre = pre $i "\t" }
+        pre == k { print $(n + 1); exit }
+    ' "$MAP"
+}
+
+# remote path configured for (host, local cwd)
+map_remote_for() {
+    [ -f "$MAP" ] || return 1
+    awk -F'\t' -v h="$1" -v l="$2" '
+        $1 != "path" { next }
+        $2 == h && $3 == l { print $4; exit }
+        tolower($2) == tolower(h) && tolower($3) == tolower(l) { alt = $4 }
+        END { if (alt != "") print alt }
+    ' "$MAP"
+}
+
+# local path configured for (host, remote cwd); falls back to any host
+map_local_for() {
+    [ -f "$MAP" ] || return 1
+    _r=$(awk -F'\t' -v h="$1" -v r="$2" '
+        $1 != "path" { next }
+        $2 == h && $4 == r { print $3; exit }
+        tolower($2) == tolower(h) && tolower($4) == tolower(r) { alt = $3 }
+        END { if (alt != "") print alt }
+    ' "$MAP")
+    [ -n "$_r" ] || _r=$(awk -F'\t' -v r="$2" '
+        $1 == "path" && $4 == r { print $3; exit }
+    ' "$MAP")
+    printf '%s' "$_r"
+}
+
+map_hosts() {
+    [ -f "$MAP" ] || return 0
+    awk -F'\t' '$1 == "path" { print $2 }' "$MAP" | sort -u
+}
+
+# ------------------------------------------------------------------ tailnet
+# `tailscale status` lines look like:
+#   100.74.108.118  m4pro-hinaser  owner@  macOS  -
+#   100.97.175.41   chia           owner@  android  offline, last seen 124d ago
+
+ts_status_cache=
+
+ts_status() {
+    [ -n "$ts_status_cache" ] || ts_status_cache=$(ts status 2>/dev/null)
+    printf '%s\n' "$ts_status_cache"
+}
+
+self_host() {
+    ts_status | awk 'NF >= 2 && $1 ~ /^[0-9]+\./ { print $2; exit }'
+}
+
+peer_field() { # name field(hostname|ip|os|state)
+    ts_status | awk -v want="$1" -v field="$2" '
+        NF >= 2 && $1 ~ /^[0-9]+\./ {
+            host = $2
+            lw = tolower(want); lh = tolower(host)
+            if (lh != lw && $1 != want) next
+            state = "online"
+            for (i = 3; i <= NF; i++) if (tolower($i) ~ /^offline/) state = "offline"
+            if (field == "hostname") print host
+            else if (field == "ip") print $1
+            else if (field == "os") print $4
+            else if (field == "state") print state
+            exit
+        }'
+}
+
+# ------------------------------------------------------------------ staging
+
+win_temp_dir() {
+    _c=/mnt/c/Windows/System32/cmd.exe
+    if [ -x "$_c" ]; then
+        _w=$( cd /mnt/c && "$_c" /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r' )
+        case $_w in
+            *%*|'') ;;
+            *) _u=$(wslpath -u "$_w" 2>/dev/null)
+               [ -n "$_u" ] && [ -d "$_u" ] && { printf '%s' "$_u/Temp"; return 0; } ;;
+        esac
+    fi
+    if [ -d /mnt/c/Users ]; then
+        _me=$(printf '%s' "${USER:-${USERNAME:-}}" | tr 'A-Z' 'a-z')
+        for u in /mnt/c/Users/*; do
+            [ -d "$u" ] || continue
+            _n=$(basename "$u" | tr 'A-Z' 'a-z')
+            [ "$_n" = "$_me" ] && { printf '%s' "$u/AppData/Local/Temp"; return 0; }
+        done
+    fi
+    [ -d /mnt/c/Windows/Temp ] && { printf '%s' /mnt/c/Windows/Temp; return 0; }
+    die "could not locate a Windows temp directory for Taildrop staging"
+}
+
+staging_dir() {
+    find_tailscale
+    if [ "$TS_CROSS" = 0 ]; then
+        mkdir -p "$OUTBOX"; printf '%s' "$OUTBOX"; return 0
+    fi
+    _cached=$(map_get local win_staging 2>/dev/null)
+    if [ -n "$_cached" ] && [ -d "$_cached" ]; then printf '%s' "$_cached"; return 0; fi
+    _d=$(win_temp_dir)/ccsync
+    mkdir -p "$_d" || die "cannot create staging dir $_d"
+    map_set local win_staging "$_d"
+    printf '%s' "$_d"
+}
+
+# Where a GUI client may auto-accept received files.
+auto_accept_dirs() {
+    [ -d "$HOME/Downloads" ] && printf '%s\n' "$HOME/Downloads"
+    if [ "$IS_WSL" = 1 ]; then
+        _s=$(map_get local win_staging 2>/dev/null)
+        if [ -n "$_s" ]; then
+            _p=$(dirname "$(dirname "$(dirname "$(dirname "$_s")")")")
+            [ -d "$_p/Downloads" ] && printf '%s\n' "$_p/Downloads"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------- transcript
+
+# Identity of each transcript line, independent of the working directory.
+# Transcripts are append-only, so comparing these tells us whether one copy is
+# a continuation of the other or whether the two have diverged.
+chain() { # file cwd
+    awk -v cwd="$2" '
+        function repl(s, from, to,   out, p) {
+            if (from == "") return s
+            out = ""
+            while ((p = index(s, from)) > 0) {
+                out = out substr(s, 1, p - 1) to
+                s = substr(s, p + length(from))
+            }
+            return out s
+        }
+        { line = $0
+          if (line ~ /^[ \t]*$/) next
+          k = index(line, "\"uuid\":\"")
+          if (k > 0) {
+              rest = substr(line, k + 8)
+              e = index(rest, "\"")
+              if (e > 1) { print substr(rest, 1, e - 1); next }
+          }
+          gsub(/\t/, " ", line)
+          print "raw:" repl(line, cwd, "\001")
+        }' "$1"
+}
+
+# 'same' | 'fast-forward' | 'behind' | 'diverged'
+compare_chains() { # local-tokens incoming-tokens
+    _ln=$(wc -l < "$1"); _in=$(wc -l < "$2")
+    if cmp -s "$1" "$2"; then printf 'same'; return 0; fi
+    if [ "$_ln" -lt "$_in" ]; then
+        head -n "$_ln" "$2" | cmp -s - "$1" && { printf 'fast-forward'; return 0; }
+    elif [ "$_in" -lt "$_ln" ]; then
+        head -n "$_in" "$1" | cmp -s - "$2" && { printf 'behind'; return 0; }
+    fi
+    printf 'diverged'
+}
+
+common_prefix_len() { # a b
+    awk 'NR==FNR { a[FNR] = $0; n = FNR; next }
+         { if (FNR > n || a[FNR] != $0) { print FNR - 1; found = 1; exit } }
+         END { if (!found) print (FNR < n ? FNR : n) }' "$1" "$2"
+}
+
+# JSON string escaping of a path: backslashes are doubled in the transcript.
+json_escape_path() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+
+rewrite_jsonl() { # src dst origin_cwd local_cwd rewrite_all -> prints "lines changed"
+    _eo=$(json_escape_path "$3"); _el=$(json_escape_path "$4")
+    awk -v from="$_eo" -v to="$_el" -v all="$5" -v out="$2" '
+        function repl(s, f, t,   o, p) {
+            if (f == "") return s
+            o = ""
+            while ((p = index(s, f)) > 0) {
+                o = o substr(s, 1, p - 1) t
+                s = substr(s, p + length(f))
+            }
+            return o s
+        }
+        BEGIN { fk = "\"cwd\":\"" from "\""; tk = "\"cwd\":\"" to "\"" }
+        {
+            lines++
+            if (from == to) { print > out; next }
+            if (all == 1) {
+                if (index($0, from) > 0) { changed++; print repl($0, from, to) > out }
+                else print > out
+            } else if (index($0, fk) > 0) {
+                changed++; print repl($0, fk, tk) > out
+            } else print > out
+        }
+        END { printf "%d %d\n", lines, changed }
+    ' "$1"
+}
+
+first_prompt() { # file
+    awk '
+        /"type":"user"/ {
+            k = index($0, "\"content\":\"")
+            if (k == 0) next
+            s = substr($0, k + 11)
+            e = index(s, "\"")
+            if (e < 2) next
+            t = substr(s, 1, e - 1)
+            if (substr(t, 1, 1) == "<") next
+            if (length(t) > 60) t = substr(t, 1, 60)
+            print t; exit
+        }' "$1"
+}
+
+session_id_of() { b=$(basename "$1"); printf '%s' "${b%.jsonl}"; }
+
+newest_session() { # cwd
+    _d=$(project_dir "$1")
+    [ -d "$_d" ] || return 1
+    _best=; _bt=0
+    for f in "$_d"/*.jsonl; do
+        [ -f "$f" ] || continue
+        _t=$(mtime_of "$f")
+        [ "$_t" -gt "$_bt" ] && { _bt=$_t; _best=$f; }
+    done
+    [ -n "$_best" ] || return 1
+    printf '%s' "$_best"
+}
+
+mtime_of() {
+    _m=$(date -r "$1" '+%s' 2>/dev/null) || _m=
+    [ -n "$_m" ] || _m=$(stat -c %Y "$1" 2>/dev/null) || _m=0
+    printf '%s' "${_m:-0}"
+}
+
+# ------------------------------------------------------------------ manifest
+
+mf_get() { awk -F'\t' -v k="$2" '$1 == k { sub(/^[^\t]*\t/, ""); print; exit }' "$1"; }
+mf_put() { printf '%s\t%s\n' "$1" "$2"; }
+
+# ------------------------------------------------------------------ commands
+
+usage() {
+    cat <<'EOF'
+ccsync - move Claude Code sessions between machines over Tailscale
+
+  ccsync push [host] [--to <remote-dir>] [--session <id>] [--no-history]
+  ccsync pull [--into <local-dir>] [--source <dir>] [--force]
+             [--rewrite-all] [--quiet] [--auto]
+  ccsync init <host> <remote-dir> [--local <dir>]
+  ccsync list [--limit N]
+  ccsync status
+  ccsync --version
+
+The receiving side needs no configuration: a pushed session carries the
+directory the sender mapped it to. Use --into to place it somewhere else.
+EOF
+}
+
+cmd_init() {
+    _host=${1:-}; _remote=${2:-}
+    shift 2 2>/dev/null || true
+    _local=$PWD
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --local) _local=$2; shift 2 ;;
+            *) die "unexpected argument: $1" ;;
+        esac
+    done
+    [ -n "$_host" ] && [ -n "$_remote" ] || { usage; exit 1; }
+    _local=$(abs_path "$_local")
+    _remote=${_remote%/}
+    [ -n "$_remote" ] || _remote=/
+
+    find_tailscale
+    _hn=$(peer_field "$_host" hostname)
+    [ -n "$_hn" ] || die "'$_host' is not in this tailnet (check \`tailscale status\`)"
+    _ip=$(peer_field "$_host" ip); _os=$(peer_field "$_host" os); _st=$(peer_field "$_host" state)
+
+    say "ccsync $VERSION"
+    say "  local  : $(self_host)  $_local"
+    say "  remote : $_hn  $_ip  $_os  $_st"
+    say "  path   : $_remote"
+
+    map_set path "$_hn" "$_local" "$_remote"
+    map_set host "$_hn" os "$_os"
+    say "  mapped : $_local -> $_hn:$_remote"
+
+    [ "$_st" = online ] || { say ""; say "  peer is offline; mapping saved. Bring it online and re-run to verify."; return 0; }
+
+    _stg=$(staging_dir)
+    _tmp=$(mktemp -d) || die "mktemp failed"
+    {
+        mf_put kind probe
+        mf_put tool_version "$VERSION"
+        mf_put created_at "$(now_iso)"
+        mf_put origin_host "$(self_host)"
+        mf_put origin_cwd "$_local"
+        mf_put claimed_remote_cwd "$_remote"
+    } > "$_tmp/manifest"
+    _b=$_stg/probe_$(self_host)_$(date '+%s').tar.gz
+    ( cd "$_tmp" && tar -czf "$_b" manifest ) || die "could not build probe"
+    rm -rf "$_tmp"
+    ts file cp "$(arg_path "$_b")" "$_hn:" >/dev/null 2>&1 || { rm -f "$_b"; die "could not send probe to $_hn"; }
+    rm -f "$_b"
+    say ""
+    say "  probe sent -> $_hn"
+    say "  On $_hn, run: ccsync pull   (or just start Claude Code there)"
+}
+
+cmd_push() {
+    _host=; _to=; _sess=; _nohist=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --to) _to=$2; shift 2 ;;
+            --session) _sess=$2; shift 2 ;;
+            --no-history) _nohist=1; shift ;;
+            -*) die "unknown option: $1" ;;
+            *) _host=$1; shift ;;
+        esac
+    done
+
+    _local=$(abs_path "$PWD")
+    find_tailscale
+
+    if [ -z "$_host" ]; then
+        _n=0
+        for h in $(map_hosts); do
+            [ -n "$(map_remote_for "$h" "$_local")" ] && { _host=$h; _n=$((_n + 1)); }
+        done
+        [ "$_n" = 1 ] || die "name the host: ccsync push <host> --to <remote-dir>"
+    fi
+
+    _hn=$(peer_field "$_host" hostname)
+    [ -n "$_hn" ] || die "'$_host' is not in this tailnet"
+
+    if [ -n "$_to" ]; then
+        _to=${_to%/}; [ -n "$_to" ] || _to=/
+        map_set path "$_hn" "$_local" "$_to"
+        _remote=$_to
+    else
+        _remote=$(map_remote_for "$_hn" "$_local")
+        [ -n "$_remote" ] || die "no directory mapped for $_local on $_hn. Pass --to <remote-dir> (recorded for next time)."
+    fi
+
+    [ "$(peer_field "$_host" state)" = online ] || \
+        die "$_hn is offline. Taildrop delivers directly and does not queue - bring the peer online and re-run."
+
+    if [ -n "$_sess" ]; then
+        case $_sess in
+            */*) _src=$_sess ;;
+            *) _src=$(project_dir "$_local")/$_sess.jsonl ;;
+        esac
+    else
+        _src=$(newest_session "$_local") || die "no sessions recorded for $_local"
+    fi
+    [ -f "$_src" ] || die "session file not found: $_src"
+
+    _sid=$(session_id_of "$_src")
+    _lines=$(wc -l < "$_src" | tr -d ' ')
+    _sha=$(sha256_of "$_src")
+    _branch=$(command -v git >/dev/null 2>&1 && git -C "$_local" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    _cv=$(claude --version 2>/dev/null | awk '{print $1; exit}')
+
+    _tmp=$(mktemp -d) || die "mktemp failed"
+    {
+        mf_put kind session
+        mf_put tool_version "$VERSION"
+        mf_put created_at "$(now_iso)"
+        mf_put origin_host "$(self_host)"
+        mf_put origin_cwd "$_local"
+        mf_put target_cwd "$_remote"
+        mf_put session_id "$_sid"
+        mf_put line_count "$_lines"
+        mf_put sha256 "$_sha"
+        mf_put git_branch "${_branch:-}"
+        mf_put claude_version "${_cv:-}"
+        mf_put first_prompt "$(first_prompt "$_src")"
+    } > "$_tmp/manifest"
+    cp "$_src" "$_tmp/$_sid.jsonl"
+
+    _hist=0
+    if [ "$_nohist" = 0 ] && [ -d "$FILE_HISTORY/$_sid" ]; then
+        _kb=$(du -sk "$FILE_HISTORY/$_sid" 2>/dev/null | awk '{print $1}')
+        if [ -n "$_kb" ] && [ "$_kb" -le "$MAX_HISTORY_KB" ]; then
+            mkdir -p "$_tmp/file-history"
+            cp -R "$FILE_HISTORY/$_sid" "$_tmp/file-history/$_sid"
+            _hist=1
+        else
+            warn "  note: skipping file-history (${_kb}KB over cap)"
+        fi
+    fi
+    printf 'file_history\t%s\n' "$_hist" >> "$_tmp/manifest"
+
+    _stg=$(staging_dir)
+    _b=$_stg/sess_${_sid}_$(self_host)_$(date '+%s').tar.gz
+    ( cd "$_tmp" && tar -czf "$_b" . ) || die "could not build bundle"
+    rm -rf "$_tmp"
+    _kb=$(du -k "$_b" | awk '{print $1}')
+    if ! ts file cp "$(arg_path "$_b")" "$_hn:" >/dev/null 2>&1; then
+        rm -f "$_b"; die "Taildrop transfer to $_hn failed"
+    fi
+    rm -f "$_b"
+    say "pushed $_sid ($_lines lines, ${_kb} KB) -> $_hn:$_remote"
+    say "  on $_hn: ccsync pull   then   claude --resume $_sid"
+}
+
+cmd_pull() {
+    _into=; _source=; _force=0; _all=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --into) _into=$2; shift 2 ;;
+            --source) _source=$2; shift 2 ;;
+            --force) _force=1; shift ;;
+            --rewrite-all) _all=1; shift ;;
+            --quiet) QUIET=1; shift ;;
+            --auto) AUTO=1; QUIET=1; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    mkdir -p "$ARCHIVE"
+    if [ -n "$_source" ]; then
+        _stg=$_source
+    else
+        _stg=$(staging_dir)
+        ts file get --conflict=rename "$(arg_path "$_stg")" >/dev/null 2>&1
+    fi
+
+    _list=$(list_bundles "$_stg")
+    if [ -z "$_list" ] && [ -z "$_source" ]; then
+        for d in $(auto_accept_dirs); do
+            [ -d "$d" ] || continue
+            _list=$(list_bundles "$d")
+            [ -n "$_list" ] && { _stg=$d; say "  (found in $d)"; break; }
+        done
+    fi
+    [ -n "$_list" ] || { say "nothing to pull"; return 0; }
+
+    _deferred=0; _conflicted=0
+    printf '%s\n' "$_list" | while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        _w=$(mktemp -d) || die "mktemp failed"
+        if ! tar -xzf "$b" -C "$_w" 2>/dev/null; then
+            warn "  skip $(basename "$b"): not a readable bundle"
+            rm -rf "$_w"; _deferred=$((_deferred + 1)); continue
+        fi
+        [ -f "$_w/manifest" ] || {
+            warn "  skip $(basename "$b"): no manifest"
+            rm -rf "$_w"; _deferred=$((_deferred + 1)); continue
+        }
+        _kind=$(mf_get "$_w/manifest" kind)
+        _ok=0
+        case $_kind in
+            probe)   handle_probe "$_w/manifest" && _ok=1 ;;
+            ack)     handle_ack "$_w/manifest" && _ok=1 ;;
+            session) handle_session "$_w/manifest" "$_w" "$_into" "$_force" "$_all"
+                     case $? in
+                         0) _ok=1 ;;
+                         2) _ok=2 ;;
+                     esac ;;
+            *) warn "  skip $(basename "$b"): unknown bundle kind '$_kind'" ;;
+        esac
+        rm -rf "$_w"
+        case $_ok in
+            1) mv "$b" "$ARCHIVE/" 2>/dev/null || rm -f "$b" ;;
+            2) mkdir -p "$CONFLICTS"
+               mv "$b" "$CONFLICTS/" 2>/dev/null
+               warn "        set aside in $CONFLICTS (it will not be retried)" ;;
+            *) say "  left queued in $_stg" ;;
+        esac
+    done
+    return 0
+}
+
+list_bundles() {
+    [ -d "$1" ] || return 0
+    for f in "$1"/sess_*.tar.gz "$1"/probe_*.tar.gz "$1"/ack_*.tar.gz; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+    done | sort
+}
+
+handle_probe() {
+    _mf=$1
+    _origin=$(mf_get "$_mf" origin_host)
+    _claimed=$(mf_get "$_mf" claimed_remote_cwd)
+    _theirs=$(mf_get "$_mf" origin_cwd)
+    _exists=no; [ -d "$_claimed" ] && _exists=yes
+
+    map_set path "$_origin" "$_claimed" "$_theirs"
+    map_set host "$_origin" verified "$(now_iso)"
+
+    say "probe from $_origin"
+    say "  $_origin:$_theirs  <->  $_claimed  ($( [ "$_exists" = yes ] && echo exists || echo 'MISSING on this machine'))"
+
+    find_tailscale
+    if [ "$(peer_field "$_origin" state)" = online ]; then
+        _stg=$(staging_dir)
+        _t=$(mktemp -d)
+        {
+            mf_put kind ack
+            mf_put tool_version "$VERSION"
+            mf_put created_at "$(now_iso)"
+            mf_put origin_host "$(self_host)"
+            mf_put origin_cwd "$_claimed"
+            mf_put peer_cwd "$_theirs"
+            mf_put path_exists "$_exists"
+            mf_put claude_version "$(claude --version 2>/dev/null | awk '{print $1; exit}')"
+        } > "$_t/manifest"
+        _b=$_stg/ack_$(self_host)_$(date '+%s').tar.gz
+        ( cd "$_t" && tar -czf "$_b" manifest )
+        rm -rf "$_t"
+        ts file cp "$(arg_path "$_b")" "$(peer_field "$_origin" hostname):" >/dev/null 2>&1 \
+            && say "  ack sent -> $_origin"
+        rm -f "$_b"
+    else
+        say "  $_origin offline; ack not sent"
+    fi
+    [ "$_exists" = yes ] || say "  fix: create $_claimed here, or re-run init on $_origin with the right path"
+    return 0
+}
+
+handle_ack() {
+    _mf=$1
+    _host=$(mf_get "$_mf" origin_host)
+    map_set host "$_host" verified "$(now_iso)"
+    map_set host "$_host" claude_version "$(mf_get "$_mf" claude_version)"
+    if [ "$(mf_get "$_mf" path_exists)" = yes ]; then _m=OK; else _m="PATH MISSING"; fi
+    say "ack from $_host: $_m  ($(mf_get "$_mf" peer_cwd) <-> $(mf_get "$_mf" origin_cwd))"
+    say "  remote Claude Code: $(mf_get "$_mf" claude_version)"
+    return 0
+}
+
+handle_session() {
+    _mf=$1; _w=$2; _into=$3; _force=$4; _all=$5
+    _sid=$(mf_get "$_mf" session_id)
+    _origin=$(mf_get "$_mf" origin_host)
+    _ocwd=$(mf_get "$_mf" origin_cwd)
+    _target=$(mf_get "$_mf" target_cwd)
+
+    if [ -n "$_into" ]; then
+        _local=$(abs_path "$_into")
+    else
+        _local=$(map_local_for "$_origin" "$_ocwd")
+        if [ -z "$_local" ] && [ -n "$_target" ] && [ -d "$_target" ]; then
+            _local=$_target
+            map_set path "$_origin" "$_local" "$_ocwd"
+            say "  mapped $_origin:$_ocwd -> $_local (as the sender specified)"
+        fi
+    fi
+    if [ -z "$_local" ]; then
+        [ "$QUIET" = 1 ] || {
+            warn "  skip $_sid: no local directory for $_origin:$_ocwd"
+            [ -n "$_target" ] && warn "        the sender mapped it to $_target, which does not exist here"
+            warn "        place it with: ccsync pull --into <local-dir>"
+        }
+        return 1
+    fi
+    [ -d "$_local" ] || { [ "$QUIET" = 1 ] || warn "  skip $_sid: $_local is not a directory"; return 1; }
+
+    _src=$_w/$_sid.jsonl
+    [ -f "$_src" ] || { warn "  skip $_sid: bundle has no transcript"; return 1; }
+    _want=$(mf_get "$_mf" sha256)
+    if [ -n "$_want" ]; then
+        _got=$(sha256_of "$_src")
+        [ -z "$_got" ] || [ "$_got" = "$_want" ] || { warn "  skip $_sid: checksum mismatch"; return 1; }
+    fi
+
+    _dd=$(project_dir "$_local")
+    _dest=$_dd/$_sid.jsonl
+
+    if [ -f "$_dest" ]; then
+        _lt=$_w/.local_tokens; _it=$_w/.incoming_tokens
+        chain "$_dest" "$_local" > "$_lt"
+        chain "$_src" "$_ocwd" > "$_it"
+        _rel=$(compare_chains "$_lt" "$_it")
+        case $_rel in
+            same)
+                say "  up to date $_sid ($(wc -l < "$_lt" | tr -d ' ') entries)"
+                return 0 ;;
+            behind)
+                [ "$_force" = 1 ] || {
+                    say "  kept local $_sid: this machine is ahead ($(wc -l < "$_lt" | tr -d ' ') entries vs $(wc -l < "$_it" | tr -d ' ') incoming)"
+                    return 0
+                } ;;
+            diverged)
+                [ "$_force" = 1 ] || {
+                    warn "  refused $_sid: diverged after $(common_prefix_len "$_lt" "$_it") entries (local $(wc -l < "$_lt" | tr -d ' '), incoming $(wc -l < "$_it" | tr -d ' ')). Both sides have work the other does not."
+                    warn "        to take theirs: ccsync pull --source $CONFLICTS --force  (a .bak copy is kept)"
+                    return 2
+                } ;;
+        esac
+        cp "$_dest" "$_dest.bak-$(date '+%s')"
+    fi
+
+    mkdir -p "$_dd"
+    set -- $(rewrite_jsonl "$_src" "$_dest" "$_ocwd" "$_local" "$_all")
+    _lines=${1:-0}; _changed=${2:-0}
+
+    if [ "$(mf_get "$_mf" file_history)" = 1 ] && [ -d "$_w/file-history/$_sid" ]; then
+        rm -rf "$FILE_HISTORY/$_sid"
+        mkdir -p "$FILE_HISTORY"
+        cp -R "$_w/file-history/$_sid" "$FILE_HISTORY/$_sid"
+    fi
+
+    printf 'pulled %s from %s\n' "$_sid" "$_origin"
+    printf '  %s lines, %s cwd rewrites: %s -> %s\n' "$_lines" "$_changed" "$_ocwd" "$_local"
+    _fp=$(mf_get "$_mf" first_prompt); [ -n "$_fp" ] && printf '  "%s"\n' "$_fp"
+    _tv=$(mf_get "$_mf" claude_version)
+    _mv=$(claude --version 2>/dev/null | awk '{print $1; exit}')
+    [ -n "$_tv" ] && [ -n "$_mv" ] && [ "$_tv" != "$_mv" ] && \
+        printf '  note: Claude Code %s (origin) vs %s (here)\n' "$_tv" "$_mv"
+    printf '  resume:  cd %s && claude --resume %s\n' "$_local" "$_sid"
+    return 0
+}
+
+cmd_list() {
+    _limit=20
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --limit) _limit=$2; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    _cwd=$(abs_path "$PWD")
+    _d=$(project_dir "$_cwd")
+    [ -d "$_d" ] || { say "no sessions for $_cwd"; return 0; }
+    say "$_cwd  ($(basename "$_d"))"
+    _n=0
+    ls -t "$_d"/*.jsonl 2>/dev/null | while IFS= read -r f; do
+        _n=$((_n + 1)); [ "$_n" -gt "$_limit" ] && break
+        printf '  %s  %s  %5s lines  %s\n' \
+            "$(session_id_of "$f")" \
+            "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || stat -c '%y' "$f" | cut -c1-16)" \
+            "$(wc -l < "$f" | tr -d ' ')" \
+            "$(first_prompt "$f")"
+    done
+}
+
+cmd_status() {
+    find_tailscale
+    _cwd=$(abs_path "$PWD")
+    say "ccsync $VERSION   tailscale: $TS_BIN"
+    say "self: $(self_host)   cwd: $_cwd"
+    _hosts=$(map_hosts)
+    [ -n "$_hosts" ] || { say "no peers configured. ccsync push <host> --to <remote-dir>"; return 0; }
+    for h in $_hosts; do
+        _v=$(map_get host "$h" verified); [ -n "$_v" ] || _v=unverified
+        say ""
+        say "$h  [$(peer_field "$h" state)]  verified: $_v"
+        awk -F'\t' -v h="$h" -v cur="$_cwd" '
+            $1 == "path" && $2 == h {
+                printf " %s %s  ->  %s\n", ($3 == cur ? "*" : " "), $3, $4
+            }' "$MAP"
+    done
+}
+
+# --------------------------------------------------------------------- main
+
+[ $# -gt 0 ] || { usage; exit 1; }
+_cmd=$1; shift
+case $_cmd in
+    init)   cmd_init "$@" ;;
+    push)   cmd_push "$@" ;;
+    pull)   cmd_pull "$@" ;;
+    list)   cmd_list "$@" ;;
+    status) cmd_status "$@" ;;
+    --version|-v) printf '%s\n' "$VERSION" ;;
+    --help|-h|help) usage ;;
+    *) usage; exit 1 ;;
+esac
