@@ -88,6 +88,7 @@ command at all. It is a no-op when nothing is waiting.
 /ccsync:list                            sessions recorded for this directory
 /ccsync:status                          peers and their mappings
 /ccsync:init <host> <remote-dir>        pair explicitly and verify the mapping
+/ccsync:unmap <host> [<local-dir>]      forget a mapping, or the peer entirely
 ```
 
 `/ccsync:init <host> <remote-dir>` is an alternative to `--to` that also sends

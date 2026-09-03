@@ -171,6 +171,23 @@ map_get() { # kind key...
     ' "$MAP"
 }
 
+map_del() { # kind key...  (removes every record with the same leading fields)
+    [ -f "$MAP" ] || return 0
+    _n=$#
+    _keys=
+    _i=1
+    while [ "$_i" -le "$_n" ]; do
+        _keys=$_keys$(eval printf '%s' "\"\${$_i}\"")$(printf '\t')
+        _i=$((_i + 1))
+    done
+    _tmp=$STATE/.map.$$
+    awk -F'\t' -v k="$_keys" -v n="$_n" '
+        { pre = ""; for (i = 1; i <= n; i++) pre = pre $i "\t" }
+        pre != k { print }
+    ' "$MAP" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    mv "$_tmp" "$MAP"
+}
+
 # remote path configured for (host, local cwd)
 map_remote_for() {
     [ -f "$MAP" ] || return 1
@@ -411,6 +428,7 @@ ccsync - move Claude Code sessions between machines over Tailscale
   ccsync pull [--into <local-dir>] [--source <dir>] [--force]
              [--rewrite-all] [--quiet] [--auto]
   ccsync init <host> <remote-dir> [--local <dir>]
+  ccsync unmap <host> [<local-dir>]
   ccsync list [--limit N]
   ccsync status
   ccsync --version
@@ -469,6 +487,30 @@ cmd_init() {
     say ""
     say "  probe sent -> $_hn"
     say "  On $_hn, run: ccsync pull   (or just start Claude Code there)"
+}
+
+
+cmd_unmap() {
+    _host=${1:-}; _dir=${2:-}
+    [ -n "$_host" ] || { usage; exit 1; }
+    [ -f "$MAP" ] || die "no mappings recorded"
+
+    if [ -n "$_dir" ]; then
+        _dir=$(abs_path "$_dir"); _dir=${_dir%/}
+        _gone=$(awk -F'\t' -v h="$_host" -v d="$_dir" \
+            '$1 == "path" && $2 == h && $3 == d { printf "  %s  ->  %s\n", $3, $4 }' "$MAP")
+        [ -n "$_gone" ] || die "$_host has no mapping for $_dir"
+        map_del path "$_host" "$_dir"
+        say "unmapped $_host:"
+    else
+        _gone=$(awk -F'\t' -v h="$_host" \
+            '$1 == "path" && $2 == h { printf "  %s  ->  %s\n", $3, $4 }' "$MAP")
+        [ -n "$_gone" ] || die "no mappings for $_host"
+        map_del path "$_host"
+        map_del host "$_host"
+        say "forgot $_host:"
+    fi
+    say "$_gone"
 }
 
 cmd_push() {
@@ -824,6 +866,7 @@ cmd_status() {
 _cmd=$1; shift
 case $_cmd in
     init)   cmd_init "$@" ;;
+    unmap)  cmd_unmap "$@" ;;
     push)   cmd_push "$@" ;;
     pull)   cmd_pull "$@" ;;
     list)   cmd_list "$@" ;;

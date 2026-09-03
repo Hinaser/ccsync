@@ -44,7 +44,7 @@ removed.
 |---|---|
 | install id | `ccsync@hinaser` |
 | marketplace name | `hinaser`, from `.claude-plugin/marketplace.json` |
-| slash commands | `/ccsync:push`, `/ccsync:pull`, `/ccsync:status`, `/ccsync:list`, `/ccsync:init` — one file per subcommand in `commands/`, since plugin commands are namespaced as `<plugin>:<command>` |
+| slash commands | `/ccsync:push`, `/ccsync:pull`, `/ccsync:status`, `/ccsync:list`, `/ccsync:init`, `/ccsync:unmap` — one file per subcommand in `commands/`, since plugin commands are namespaced as `<plugin>:<command>` |
 | state directory | `~/.claude/ccsync/` — no `claude-` prefix inside `~/.claude` |
 
 ## Releasing
