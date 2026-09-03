@@ -4,7 +4,11 @@
 # Dependencies: a POSIX shell, awk, tar, and the tailscale CLI. Nothing else.
 set -u
 
-VERSION=0.1.0
+SELF_DIR=${0%/*}
+[ "$SELF_DIR" = "$0" ] && SELF_DIR=.
+VERSION=$(awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' \
+    "$SELF_DIR/../.claude-plugin/plugin.json" 2>/dev/null)
+: "${VERSION:=unknown}"
 
 CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 PROJECTS=$CLAUDE_HOME/projects

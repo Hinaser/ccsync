@@ -49,7 +49,9 @@ removed.
 
 ## Releasing
 
-1. bump `version` in `.claude-plugin/plugin.json` (it decides the install cache path)
+1. bump `version` in `.claude-plugin/plugin.json` — the only place a version
+   lives; it decides the install cache path and `bin/ccsync` reads it for
+   `tool_version`
 2. commit
 3. `git tag -a vX.Y.Z -m "ccsync X.Y.Z" && git push origin vX.Y.Z`
 4. `gh release create vX.Y.Z --notes ...`
