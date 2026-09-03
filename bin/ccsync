@@ -81,6 +81,7 @@ ts() {
 
 # Render a local path the way the tailscale binary expects it.
 arg_path() {
+    find_tailscale
     if [ "$TS_CROSS" = 1 ]; then
         wslpath -w "$1"
     else
@@ -629,7 +630,9 @@ cmd_pull() {
         _stg=$_source
     else
         _stg=$(staging_dir)
-        ts file get --conflict=rename "$(arg_path "$_stg")" >/dev/null 2>&1
+        _err=$(ts file get --conflict=rename "$(arg_path "$_stg")" 2>&1) || {
+            [ "$QUIET" = 1 ] || warn "ccsync: taildrop fetch failed: ${_err:-unknown error}"
+        }
     fi
 
     _list=$(list_bundles "$_stg")
