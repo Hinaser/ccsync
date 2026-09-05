@@ -446,8 +446,8 @@ usage() {
     cat <<'EOF'
 ccsync - move Claude Code sessions between machines over Tailscale
 
-  ccsync push [host] [--to <remote-dir>] [--session <id>] [--no-history]
-  ccsync pull [--into <local-dir>] [--source <dir>] [--force]
+  ccsync push [-r] [host[:<remote-dir>]] [--session <id>] [--no-history]
+  ccsync pull [<local-dir>] [--source <dir>] [--force]
              [--rewrite-all] [--quiet] [--auto]
   ccsync init <host> <remote-dir> [--local <dir>]
   ccsync unmap <host> [<local-dir>]
@@ -456,7 +456,10 @@ ccsync - move Claude Code sessions between machines over Tailscale
   ccsync --version
 
 The receiving side needs no configuration: a pushed session carries the
-directory the sender mapped it to. Use --into to place it somewhere else.
+directory the sender mapped it to. Use ccsync pull <local-dir> to place it somewhere else.
+Use -r to include the whole current project: ccsync push -r host:/path/to/project
+Push sends a Taildrop bundle; pull imports it on the receiving machine.
+Pull accepts only a local destination, not host:/path. SessionStart runs pull automatically.
 EOF
 }
 
@@ -535,17 +538,94 @@ cmd_unmap() {
     say "$_gone"
 }
 
+# Copy a selected project path into staging. Subshells keep recursive variables
+# separate in POSIX sh. Reject links (including ancestor links) and special files.
+stage_project_path() (
+    root=$1; dest=$2; rel=$3
+    case $rel in
+        ''|/*|*\\*|[A-Za-z]:*|../*|*/../*|*/..|..) return 1 ;;
+    esac
+    case $rel in
+        *"
+"*|*"	"*) return 1 ;;
+    esac
+    probe=$root
+    rest=$rel
+    while :; do
+        part=${rest%%/*}
+        probe=$probe/$part
+        [ ! -L "$probe" ] || return 1
+        case $rest in */*) rest=${rest#*/} ;; *) break ;; esac
+    done
+    src=$root/$rel
+    if [ -d "$src" ]; then
+        mkdir -p "$dest/$rel" || return 1
+        for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            stage_project_path "$root" "$dest" "$rel/${entry##*/}" || return 1
+        done
+    elif [ -f "$src" ]; then
+        mkdir -p "$(dirname "$dest/$rel")" && cp -p "$src" "$dest/$rel" || return 1
+    else
+        return 1
+    fi
+)
+
+# Check the whole tree before adding anything. Never replace a differing file,
+# a symlink, or a file/directory collision, even when transcript --force is used.
+merge_project_tree() (
+    src=$1; dest=$2; mode=$3
+    [ ! -L "$src" ] && [ ! -L "$dest" ] || {
+        warn "  project conflict: symlink at $dest"; return 1;
+    }
+    if [ -d "$src" ]; then
+        if [ -e "$dest" ] && [ ! -d "$dest" ]; then
+            warn "  project conflict: $dest is not a directory"; return 1
+        fi
+        [ "$mode" != apply ] || mkdir -p "$dest" || return 1
+        for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            merge_project_tree "$entry" "$dest/${entry##*/}" "$mode" || return 1
+        done
+    elif [ -f "$src" ]; then
+        if [ -e "$dest" ]; then
+            [ -f "$dest" ] && cmp -s "$src" "$dest" || {
+                warn "  project conflict: $dest differs"; return 1;
+            }
+        elif [ "$mode" = apply ]; then
+            cp -p "$src" "$dest" || return 1
+        fi
+    else
+        warn "  unsupported project entry: $src"; return 1
+    fi
+)
+
+restore_project() {
+    [ "$_project" = 1 ] || return 0
+    merge_project_tree "$_w/project" "$_local" check || return 2
+    merge_project_tree "$_w/project" "$_local" apply || return 1
+    say "  project files restored to $_local (existing identical files kept)"
+}
+
 cmd_push() {
-    _host=; _to=; _sess=; _nohist=0
+    _host=; _to=; _sess=; _nohist=0; _recursive=0
     while [ $# -gt 0 ]; do
         case $1 in
-            --to) _to=$2; shift 2 ;;
             --session) _sess=$2; shift 2 ;;
             --no-history) _nohist=1; shift ;;
+            -r) _recursive=1; shift ;;
             -*) die "unknown option: $1" ;;
-            *) _host=$1; shift ;;
+            *) [ -z "$_host" ] || die "expected one destination: ccsync push [-r] host:/remote-dir"
+               _host=$1; shift ;;
         esac
     done
+
+    case $_host in
+        *:*)
+            _address_path=${_host#*:}; _host=${_host%%:*}
+            [ -n "$_host" ] && [ -n "$_address_path" ] || die "use host:/remote-dir or just host for a remembered destination"
+            _to=$_address_path ;;
+    esac
 
     _local=$(abs_path "$PWD")
     find_tailscale
@@ -555,7 +635,7 @@ cmd_push() {
         for h in $(map_hosts); do
             [ -n "$(map_remote_for "$h" "$_local")" ] && { _host=$h; _n=$((_n + 1)); }
         done
-        [ "$_n" = 1 ] || die "name the host: ccsync push <host> --to <remote-dir>"
+        [ "$_n" = 1 ] || die "name the destination: ccsync push host:/remote-dir"
     fi
 
     _hn=$(peer_field "$_host" hostname)
@@ -567,7 +647,7 @@ cmd_push() {
         _remote=$_to
     else
         _remote=$(map_remote_for "$_hn" "$_local")
-        [ -n "$_remote" ] || die "no directory mapped for $_local on $_hn. Pass --to <remote-dir> (recorded for next time)."
+        [ -n "$_remote" ] || die "no directory mapped for $_local on $_hn. Use $_hn:/remote-dir (recorded for next time)."
     fi
 
     [ "$(peer_field "$_host" state)" = online ] || \
@@ -590,8 +670,15 @@ cmd_push() {
     _cv=$(claude --version 2>/dev/null | awk '{print $1; exit}')
 
     _tmp=$(mktemp -d) || die "mktemp failed"
+    if [ "$_recursive" = 1 ]; then
+        if ! stage_project_path "$_local" "$_tmp/project" .; then
+            rm -rf "$_tmp"
+            die "could not copy project: symlinks, special files and unsupported filenames are not allowed"
+        fi
+    fi
     {
         mf_put kind session
+        [ "$_recursive" = 0 ] || mf_put project_files 1
         mf_put tool_version "$VERSION"
         mf_put created_at "$(now_iso)"
         mf_put origin_host "$(self_host)"
@@ -619,16 +706,25 @@ cmd_push() {
     fi
     printf 'file_history\t%s\n' "$_hist" >> "$_tmp/manifest"
 
+    _uk=$(du -sk "$_tmp" | awk '{print $1}')
+    [ "$_uk" -le "$MAX_UNPACKED_KB" ] || {
+        rm -rf "$_tmp"; die "bundle exceeds the ${MAX_UNPACKED_KB} KB unpacked limit; reduce the project size or omit -r"
+    }
+
     _stg=$(staging_dir)
     _b=$_stg/sess_${_sid}_$(self_host)_$(date '+%s').tar.gz
     ( cd "$_tmp" && tar -czf "$_b" . ) || die "could not build bundle"
     rm -rf "$_tmp"
     _kb=$(du -k "$_b" | awk '{print $1}')
+    [ "$_kb" -le "$MAX_BUNDLE_KB" ] || {
+        rm -f "$_b"; die "bundle exceeds the ${MAX_BUNDLE_KB} KB transfer limit; reduce the project size or omit -r"
+    }
     if ! ts file cp "$(arg_path "$_b")" "$_hn:" >/dev/null 2>&1; then
         rm -f "$_b"; die "Taildrop transfer to $_hn failed"
     fi
     rm -f "$_b"
     say "pushed $_sid ($_lines lines, ${_kb} KB) -> $_hn:$_remote"
+    [ "$_recursive" = 0 ] || say "  includes project files (receiver must run a version supporting project transfer)"
     say "  on $_hn: ccsync pull   then   claude --resume $_sid"
 }
 
@@ -636,15 +732,21 @@ cmd_pull() {
     _into=; _source=; _force=0; _all=0
     while [ $# -gt 0 ]; do
         case $1 in
-            --into) _into=$2; shift 2 ;;
             --source) _source=$2; shift 2 ;;
             --force) _force=1; shift ;;
             --rewrite-all) _all=1; shift ;;
             --quiet) QUIET=1; shift ;;
             --auto) AUTO=1; QUIET=1; shift ;;
-            *) die "unknown option: $1" ;;
+            -*) die "unknown option: $1" ;;
+            *) [ -z "$_into" ] && [ -n "$1" ] || die "expected one local destination: ccsync pull [local-dir]"
+               _into=$1; shift ;;
         esac
     done
+
+    case $_into in
+        [A-Za-z]:/*|[A-Za-z]:\\*|/*|./*|../*) ;;
+        *:*) die "pull accepts a local directory, not a remote source; run push on the sending machine first" ;;
+    esac
 
     private_dir "$STATE"; private_dir "$ARCHIVE"
     if [ -n "$_source" ]; then
@@ -675,6 +777,18 @@ cmd_pull() {
             reject_bundle "$b"; continue
         fi
         _w=$(mktemp -d) || die "mktemp failed"
+        # Check paths and entry types before extraction: project payloads must
+        # not introduce traversal, symbolic links, hard links or devices.
+        if ! tar -tzf "$b" > "$_w/.members" 2>/dev/null ||
+           ! awk '/^\// || /\\/ || /^[A-Za-z]:/ { bad=1 }
+                  { n=split($0,a,"/"); for(i=1;i<=n;i++) if(a[i]=="..") bad=1 }
+                  END { exit bad }' "$_w/.members" ||
+           ! tar -tvzf "$b" > "$_w/.types" 2>/dev/null ||
+           ! awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" { bad=1 }
+                  END { exit bad }' "$_w/.types"; then
+            warn "  reject $(basename "$b"): unsafe archive paths or unsupported entry types"
+            rm -rf "$_w"; reject_bundle "$b"; continue
+        fi
         if ! tar -xzf "$b" -C "$_w" 2>/dev/null; then
             warn "  reject $(basename "$b"): not a readable bundle"
             rm -rf "$_w"; reject_bundle "$b"; continue
@@ -787,6 +901,11 @@ handle_session() {
     _origin=$(mf_get "$_mf" origin_host)
     _ocwd=$(mf_get "$_mf" origin_cwd)
     _target=$(mf_get "$_mf" target_cwd)
+    _project=$(mf_get "$_mf" project_files)
+    case $_project in ''|0|1) ;; *) warn "  skip bundle: unknown project payload format"; return 2 ;; esac
+    if [ "$_project" = 1 ] && [ ! -d "$_w/project" ]; then
+        warn "  skip bundle: project payload missing"; return 2
+    fi
     safe_component "$_sid" || { warn "  skip bundle: unusable session id"; return 1; }
     safe_component "$_origin" || { warn "  skip $_sid: unusable origin host"; return 1; }
 
@@ -804,11 +923,18 @@ handle_session() {
         [ "$QUIET" = 1 ] || {
             warn "  skip $_sid: no local directory for $_origin:$_ocwd"
             [ -n "$_target" ] && warn "        the sender mapped it to $_target, which does not exist here"
-            warn "        place it with: ccsync pull --into <local-dir>"
+            warn "        place it with: ccsync pull <local-dir>"
         }
         return 1
     fi
-    [ -d "$_local" ] || { [ "$QUIET" = 1 ] || warn "  skip $_sid: $_local is not a directory"; return 1; }
+    # Only an explicit local destination may create a new project directory.
+    if [ ! -d "$_local" ]; then
+        if [ -n "$_into" ] && [ "$_project" = 1 ] && [ ! -e "$_local" ] && [ ! -L "$_local" ]; then
+            case $_local in /*|[A-Za-z]:*) ;; *) _local=$PWD/$_local ;; esac
+        else
+            [ "$QUIET" = 1 ] || warn "  skip $_sid: $_local is not a directory"; return 1
+        fi
+    fi
 
     _src=$_w/$_sid.jsonl
     [ -f "$_src" ] || { warn "  skip $_sid: bundle has no transcript"; return 1; }
@@ -828,6 +954,8 @@ handle_session() {
         _rel=$(compare_chains "$_lt" "$_it")
         case $_rel in
             same)
+                restore_project || return $?
+                map_set path "$_origin" "$_local" "$_ocwd"
                 say "  up to date $_sid ($(wc -l < "$_lt" | tr -d ' ') entries)"
                 return 0 ;;
             behind)
@@ -842,6 +970,10 @@ handle_session() {
                     return 2
                 } ;;
         esac
+    fi
+
+    restore_project || return $?
+    if [ -f "$_dest" ]; then
         _bak=$_dest.bak-$(date '+%s'); _n=0
         while [ -e "$_bak" ]; do
             _n=$((_n + 1)); _bak=$_dest.bak-$(date '+%s')-$_n
@@ -857,6 +989,7 @@ handle_session() {
         rm -f "$_new"; warn "  skip $_sid: could not write transcript"; return 1
     }
     mv "$_new" "$_dest" || { rm -f "$_new"; warn "  skip $_sid: could not place transcript"; return 1; }
+    map_set path "$_origin" "$_local" "$_ocwd"
     set -- $_counts
     _lines=${1:-0}; _changed=${2:-0}
 
@@ -913,7 +1046,7 @@ cmd_status() {
     say "ccsync $VERSION   tailscale: $TS_BIN"
     say "self: $(self_host)   cwd: $_cwd"
     _hosts=$(map_hosts)
-    [ -n "$_hosts" ] || { say "no peers configured. ccsync push <host> --to <remote-dir>"; return 0; }
+    [ -n "$_hosts" ] || { say "no peers configured. ccsync push <host>:/remote-dir"; return 0; }
     for h in $_hosts; do
         _v=$(map_get host "$h" verified); [ -n "$_v" ] || _v=unverified
         say ""
