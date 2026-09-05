@@ -3,6 +3,10 @@
 A Claude Code plugin that moves session transcripts between machines over
 Tailscale (Taildrop). `bin/ccsync` is the whole implementation.
 
+Push sends to `host:/path`; `-r` includes the whole current project. Pull runs
+on the receiving machine and accepts only an optional local destination.
+It imports waiting Taildrop bundles; it does not fetch from a remote host.
+
 ## Constraints that are easy to break
 
 **Dependencies are sh, awk, tar and the Tailscale CLI. Nothing else.** No
@@ -34,7 +38,7 @@ divergence is set aside in `~/.claude/ccsync/conflicts/`. A pull must never be
 able to discard work that exists only on the receiving machine.
 
 **No searching of the filesystem.** An arriving session is placed using
-`--into`, a recorded mapping, or the `target_cwd` the sender named with `--to`
+an explicit local destination, a recorded mapping, or the `target_cwd` the sender named with `host:/path`
 — in that order. Scanning `$HOME` for a plausible directory was tried and
 removed.
 
@@ -63,11 +67,12 @@ the same check.
 1. bump `version` in `.claude-plugin/plugin.json` — the only place a version
    lives; it decides the install cache path and `bin/ccsync` reads it for
    `tool_version`
-2. commit
+2. update `RELEASE_NOTES.md`, run `sh tests/project-transfer.sh` and
+   `sh -n bin/ccsync`, then commit
 3. `git tag -a vX.Y.Z -m "ccsync X.Y.Z" && git push origin vX.Y.Z`
-4. `gh release create vX.Y.Z --notes ...`
-5. refresh this machine's own install: `claude plugin update ccsync@hinaser`,
-   then restart
+4. `gh release create vX.Y.Z --notes-file RELEASE_NOTES.md`
+5. refresh this machine's own install: `claude plugin marketplace update hinaser`
+   then `claude plugin update ccsync@hinaser`, then restart
 
 Releases carry no assets; a plugin is installed from the repository, not
 downloaded. Do not force-update a tag that has been published.
@@ -85,6 +90,13 @@ Both sides can be exercised locally:
 
 A bundle is a `.tar.gz` of a tab-separated `manifest` plus `<session-id>.jsonl`,
 named `sess_*`, `probe_*` or `ack_*`.
+
+`push -r host:/path` adds the whole current project as a `project/` tree with
+`project_files\t1` in the manifest. Project restore preflights every path and
+refuses differing contents or type collisions, even with `--force`. No project
+files are deleted. Archives accept only regular files and directories and are
+checked for traversal before extraction. Run `sh tests/project-transfer.sh` for
+the isolated sender/receiver integration tests.
 
 ## WSL
 

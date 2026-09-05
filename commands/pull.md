@@ -1,6 +1,6 @@
 ---
-description: Receive Claude Code sessions waiting for this machine
-argument-hint: [--into <local-dir>] [--force] [--source <dir>]
+description: Import waiting Taildrop sessions and project files into a local directory (no remote source)
+argument-hint: [<local-dir>] [--force] [--source <dir>]
 allowed-tools: Bash
 ---
 
