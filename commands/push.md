@@ -1,6 +1,6 @@
 ---
-description: Send this Claude Code session and optional project files to another machine over Tailscale
-argument-hint: [-r] [host[:/remote-dir]] [--session <id>] [--no-history]
+description: Send this Claude Code session and optional project files to another machine using the configured transport
+argument-hint: [-r] [host[:/remote-dir]] [--session <id>] [--no-history] [--transport tailscale|filesystem] [--share <dir>]
 allowed-tools: Bash
 ---
 

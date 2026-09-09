@@ -1,50 +1,53 @@
-# ccsync 0.4.0
+# ccsync 0.5.0
 
-Transfer the current project alongside its Claude Code session with:
+Transfer Claude Code sessions and projects through Windows file shares, mounted
+SMB shares, or WSL host storage, alongside the existing Tailscale transport.
 
+## Set up a shared filesystem once
+
+Create a dedicated directory that both endpoints can access, then register each
+endpoint using its own local path:
+
+```text
+# WSL
+/ccsync:setup --share /mnt/c/Users/you/ccsync-share --host wsl
+
+# Windows
+/ccsync:setup --share C:/Users/you/ccsync-share --host windows
 ```
-/ccsync:push -r mac-mini:/home/hinaser/projects/aaa
+
+Discover the receiver and transfer a project:
+
+```text
+/ccsync:status
+/ccsync:push -r windows:C:/Users/you/projects/example
 ```
 
-On the receiving machine, import the waiting bundle with:
+On Windows, run `/ccsync:pull`, or start Claude Code in an existing destination
+and let the session-start hook import it automatically. Configuration is saved;
+no shell exports are required for future launches.
 
-```
-/ccsync:pull /home/hinaser/projects/aaa
-```
+## Changes
 
-For existing destinations, the session-start hook also runs pull automatically.
-Pull imports bundles already delivered by Taildrop; it cannot fetch from a
-remote `host:/path`. No SSH server is needed.
+- Filesystem bundles are queued in separate endpoint inboxes and published only
+  after copying finishes. Incomplete copies are ignored.
+- Transports are remembered per peer. Add a Taildrop peer with
+  `init <peer> <remote-dir> --transport tailscale`, or select a share with
+  `--share <dir>` on init or push.
+- Manual and automatic pulls check all configured inboxes. An unavailable share
+  does not block other transports; automatic hooks suppress missing-mount errors.
+- Status shows configuration, discovered peers, routes, queue counts and
+  availability. Unknown filesystem peers are rejected with setup guidance.
+- Pairing confirms receiver names and directory mappings. Windows path spellings
+  are normalized for mappings, while transcripts retain native Windows paths.
+- Existing Taildrop mappings, environment overrides, and older bundles remain
+  supported. Fast-forward and project-conflict protections are unchanged.
+- Machine-specific network examples were replaced with generic values. Public
+  account handles remain; new release metadata uses the GitHub noreply identity.
 
-## Breaking command changes
+## Update
 
-- Push destinations use `host:/path`; `--to` is removed.
-- `-r` includes the whole current project; `--include` and individual path
-  selection are removed. Omit `-r` for session and rewind history only.
-- Pull takes a positional local destination; `--into` is removed.
-- Remembered destinations still work: `push -r host`, or `push -r` when only one
-  host is mapped. Plain `pull` uses the recorded or sender-specified destination.
-
-## Project transfer behavior
-
-- Includes nested directories, hidden files, empty directories and executable
-  files. Nothing is filtered: `.git`, ignored files, dependencies and `.env`
-  are included too.
-- Adds missing files and keeps identical contents. Differing files, symlinks
-  and file/directory collisions set the bundle aside before applying it.
-  `--force` only overrides transcript conflicts; it never overwrites project
-  conflicts. Project files are not deleted.
-- Explicit `pull /new/local/path` can create a destination for project bundles.
-- Project files can arrive with an unchanged transcript. Stale or diverged
-  transcripts retain their existing protections.
-- Bundles are limited to 64 MB compressed and 256 MB unpacked. Symlinks and
-  special files are unsupported; archive paths and entry types are checked
-  before extraction.
-
-Update ccsync on both machines for project transfer. Older receivers import
-only the session. Existing session-only bundles remain supported.
-
-Run in a terminal on each machine, then restart Claude Code:
+Run on each endpoint, then restart Claude Code:
 
 ```sh
 claude plugin marketplace update hinaser
@@ -52,12 +55,12 @@ claude plugin update ccsync@hinaser
 claude plugin list
 ```
 
-Confirm version 0.4.0 is listed. Existing sessions and mappings are preserved.
+Confirm version **0.5.0**. Existing sessions and directory mappings are preserved.
+Tailscale remains the default; filesystem delivery requires setup on both ends.
 
 ## Validation
 
-Local sender/receiver integration tests use isolated Claude configurations and
-a Tailscale stub. They cover recursive transfer, conflicts, unchanged and stale
-transcripts, new destinations, remembered destinations, removed syntax, and
-symlink rejection. Real cross-machine and macOS/Windows validation remains to
-be performed.
+All five test scripts pass: project transfer, filesystem delivery, configuration
+and mixed transports, Windows path handling and pairing, and a real
+WSL → Windows Git Bash → WSL round trip using host storage. Shell syntax and
+whitespace checks pass. Live SMB-server and macOS testing remain outstanding.

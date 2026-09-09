@@ -1,5 +1,5 @@
 ---
-description: Import waiting Taildrop sessions and project files into a local directory (no remote source)
+description: Import waiting sessions and project files into a local directory (no remote source)
 argument-hint: [<local-dir>] [--force] [--source <dir>]
 allowed-tools: Bash
 ---

@@ -1,7 +1,7 @@
 #!/bin/sh
-# ccsync - move Claude Code sessions between machines over Tailscale.
+# ccsync - move Claude Code sessions between machines.
 #
-# Dependencies: a POSIX shell, awk, tar, and the tailscale CLI. Nothing else.
+# Dependencies: POSIX utilities; the Tailscale CLI for Taildrop only.
 set -u
 
 # Received bundles carry transcripts: keep everything this script writes private.
@@ -27,10 +27,12 @@ MAX_UNPACKED_KB=262144    # and one that expands past this
 
 QUIET=0
 AUTO=0
+TRANSPORT=${CCSYNC_TRANSPORT:-tailscale}
+SHARE=${CCSYNC_SHARE:-}
+FS_HOST=${CCSYNC_HOST:-}
 
 die() {
     printf 'ccsync: %s\n' "$*" >&2
-    [ "$AUTO" = 1 ] && exit 0
     exit 1
 }
 say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
@@ -48,6 +50,9 @@ is_wsl() {
 
 IS_WSL=0
 is_wsl && IS_WSL=1
+
+IS_WINDOWS=0
+case $(uname -s) in MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;; esac
 
 TS_BIN=
 TS_CROSS=0     # a Windows binary driven from WSL: its arguments must be Windows paths
@@ -140,11 +145,49 @@ project_dir() {
     printf '%s' "$_direct"
 }
 
-abs_path() {
-    case $1 in
-        /*|[A-Za-z]:*) printf '%s' "$1" ;;
-        *) ( cd "$1" 2>/dev/null && pwd ) || printf '%s' "$1" ;;
-    esac
+# Normalize Windows spellings without treating a WSL /mnt/c path as Windows.
+normalize_path() {
+    printf '%s' "$1" | awk '
+        {s=$0; if(s ~ /^[A-Za-z]:/ || s ~ /^\\\\/) {
+            gsub(/\\/, "/", s)
+            if(s ~ /^[A-Za-z]:/) s=toupper(substr(s,1,1)) substr(s,2)
+        }
+        while(length(s)>1 && s ~ /\/$/ && s !~ /^[A-Za-z]:\/$/) s=substr(s,1,length(s)-1)
+        printf "%s",s}'
+}
+
+abs_path() (
+    [ -n "$1" ] || return 0
+    if [ "$IS_WINDOWS" = 1 ] && command -v cygpath >/dev/null 2>&1; then
+        normalize_path "$(cygpath -am "$1")"
+    else
+        if [ -d "$1" ]; then
+            (cd "$1" && pwd)
+            return
+        fi
+        case $1 in
+            /*|[A-Za-z]:*|\\\\*) normalize_path "$1" ;;
+            *) normalize_path "$PWD/$1" ;;
+        esac
+    fi
+)
+
+transcript_cwd() {
+    if [ "$IS_WINDOWS" = 1 ] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -aw "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# GNU tar treats a colon in -f as a remote host; use a Git Bash path for
+# archive filenames while retaining canonical/native paths elsewhere.
+archive_path() {
+    if [ "$IS_WINDOWS" = 1 ] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -au "$1"
+    else
+        printf '%s' "$1"
+    fi
 }
 
 # ---------------------------------------------------------------- state file
@@ -159,7 +202,11 @@ private_dir() { mkdir -p "$1" && chmod 700 "$1" 2>/dev/null || :; }
 
 map_init() { private_dir "$STATE"; [ -f "$MAP" ] || : > "$MAP"; }
 
-map_set() { # kind key... value  (replaces any record with the same leading fields)
+map_set() ( # kind key... value  (replaces any record with the same leading fields)
+    for field in "$@"; do valid_field "$field" || die "tabs and newlines are not supported in configuration fields"; done
+    if [ "$1" = path ]; then
+        set -- "$1" "$2" "$(abs_path "$3")" "$(normalize_path "$4")"
+    fi
     map_init
     _n=$#
     _val=$(eval printf '%s' "\"\${$_n}\"")
@@ -169,14 +216,16 @@ map_set() { # kind key... value  (replaces any record with the same leading fiel
         _keys=$_keys$(eval printf '%s' "\"\${$_i}\"")$(printf '\t')
         _i=$((_i + 1))
     done
-    _tmp=$STATE/.map.$$
-    awk -F'\t' -v k="$_keys" -v n="$((_n - 1))" '
+    _tmp=$(mktemp "$STATE/.map.XXXXXXXXXX") || return 1
+    CCSYNC_PATH_WINDOWS=$IS_WINDOWS CCSYNC_MAP_KEYS=$_keys awk -F'\t' -v n="$((_n - 1))" "$PATH_AWK"'
+        BEGIN {split(ENVIRON["CCSYNC_MAP_KEYS"],keys,"\t")}
+        $1=="path" && keys[1]=="path" && $2==keys[2] && pathkey($3,1)==pathkey(keys[3],1) {next}
         { pre = ""; for (i = 1; i <= n; i++) pre = pre $i "\t" }
-        pre != k { print }
-    ' "$MAP" > "$_tmp" 2>/dev/null || : > "$_tmp"
+        pre != ENVIRON["CCSYNC_MAP_KEYS"] { print }
+    ' "$MAP" > "$_tmp" || { rm -f "$_tmp"; return 1; }
     printf '%s%s\n' "$_keys" "$_val" >> "$_tmp"
     mv "$_tmp" "$MAP"
-}
+)
 
 map_get() { # kind key...
     [ -f "$MAP" ] || return 1
@@ -187,13 +236,13 @@ map_get() { # kind key...
         _keys=$_keys$(eval printf '%s' "\"\${$_i}\"")$(printf '\t')
         _i=$((_i + 1))
     done
-    awk -F'\t' -v k="$_keys" -v n="$_n" '
+    CCSYNC_MAP_KEYS=$_keys awk -F'\t' -v n="$_n" '
         { pre = ""; for (i = 1; i <= n; i++) pre = pre $i "\t" }
-        pre == k { print $(n + 1); exit }
+        pre == ENVIRON["CCSYNC_MAP_KEYS"] { print $(n + 1); exit }
     ' "$MAP"
 }
 
-map_del() { # kind key...  (removes every record with the same leading fields)
+map_del() ( # kind key...  (removes every record with the same leading fields)
     [ -f "$MAP" ] || return 0
     _n=$#
     _keys=
@@ -202,49 +251,273 @@ map_del() { # kind key...  (removes every record with the same leading fields)
         _keys=$_keys$(eval printf '%s' "\"\${$_i}\"")$(printf '\t')
         _i=$((_i + 1))
     done
-    _tmp=$STATE/.map.$$
-    awk -F'\t' -v k="$_keys" -v n="$_n" '
+    _tmp=$(mktemp "$STATE/.map.XXXXXXXXXX") || return 1
+    CCSYNC_MAP_KEYS=$_keys awk -F'\t' -v n="$_n" '
         { pre = ""; for (i = 1; i <= n; i++) pre = pre $i "\t" }
-        pre != k { print }
+        pre != ENVIRON["CCSYNC_MAP_KEYS"] { print }
     ' "$MAP" > "$_tmp" || { rm -f "$_tmp"; return 1; }
     mv "$_tmp" "$MAP"
-}
+)
 
-# remote path configured for (host, local cwd)
+# Map keys use forward slashes on Windows; transcripts use native Windows cwd.
+# Environment values avoid awk -v interpreting backslashes in user paths.
+PATH_AWK='
+function pathkey(s, islocal) {
+    if(s ~ /^[A-Za-z]:/ || s ~ /^\\\\/) gsub(/\\/, "/", s)
+    if(islocal && ENVIRON["CCSYNC_PATH_WINDOWS"]==1 && s ~ /^\/[A-Za-z](\/|$)/)
+        s=substr(s,2,1) ":" substr(s,3)
+    while(length(s)>1 && s ~ /\/$/ && s !~ /^[A-Za-z]:\/$/) s=substr(s,1,length(s)-1)
+    if(s ~ /^[A-Za-z]:/ || s ~ /^\/\//) s=tolower(s)
+    return s
+}'
+
 map_remote_for() {
     [ -f "$MAP" ] || return 1
-    awk -F'\t' -v h="$1" -v l="$2" '
-        $1 != "path" { next }
-        $2 == h && $3 == l { print $4; exit }
-        tolower($2) == tolower(h) && tolower($3) == tolower(l) { alt = $4 }
-        END { if (alt != "") print alt }
-    ' "$MAP"
+    CCSYNC_PATH_WINDOWS=$IS_WINDOWS CCSYNC_LOOKUP_HOST=$1 CCSYNC_LOOKUP_PATH=$2 awk -F '\t' "$PATH_AWK"'
+        $1=="path" && tolower($2)==tolower(ENVIRON["CCSYNC_LOOKUP_HOST"]) &&
+        pathkey($3,1)==pathkey(ENVIRON["CCSYNC_LOOKUP_PATH"],1) {print $4; exit}' "$MAP"
 }
 
-# local path configured for (host, remote cwd); falls back to any host
 map_local_for() {
     [ -f "$MAP" ] || return 1
-    _r=$(awk -F'\t' -v h="$1" -v r="$2" '
-        $1 != "path" { next }
-        $2 == h && $4 == r { print $3; exit }
-        tolower($2) == tolower(h) && tolower($4) == tolower(r) { alt = $3 }
-        END { if (alt != "") print alt }
-    ' "$MAP")
-    [ -n "$_r" ] || _r=$(awk -F'\t' -v r="$2" '
-        $1 == "path" && $4 == r { print $3; exit }
-    ' "$MAP")
-    printf '%s' "$_r"
+    CCSYNC_PATH_WINDOWS=$IS_WINDOWS CCSYNC_LOOKUP_HOST=$1 CCSYNC_LOOKUP_PATH=$2 awk -F '\t' "$PATH_AWK"'
+        $1=="path" && pathkey($4,0)==pathkey(ENVIRON["CCSYNC_LOOKUP_PATH"],0) {
+            if(tolower($2)==tolower(ENVIRON["CCSYNC_LOOKUP_HOST"])) {print $3; found=1; exit}
+            if(alt=="") alt=$3
+        } END {if(!found && alt!="") print alt}' "$MAP"
 }
 
 map_hosts() {
     [ -f "$MAP" ] || return 0
-    awk -F'\t' '$1 == "path" { print $2 }' "$MAP" | sort -u
+    awk -F'\t' '$1 == "path" || $1 == "host" { print $2 }' "$MAP" | sort -u
+}
+
+# ---------------------------------------------------------------- configuration
+
+load_config() {
+    DEFAULT_TRANSPORT=$(map_get local transport); : "${DEFAULT_TRANSPORT:=tailscale}"
+    DEFAULT_SHARE=$(map_get local share)
+    FS_HOST=${CCSYNC_HOST:-$(map_get local host)}
+    TRANSPORT=${CCSYNC_TRANSPORT:-$DEFAULT_TRANSPORT}
+    SHARE=${CCSYNC_SHARE:-$DEFAULT_SHARE}
+    [ -z "$SHARE" ] || SHARE=$(abs_path "$SHARE")
+    OPT_TRANSPORT=; OPT_SHARE=
+    RECEIVE_ROUTE=0
+}
+
+need_value() {
+    [ "$#" -ge 2 ] && [ -n "$2" ] || die "$1 requires a value; see ccsync help"
+    case $2 in --* ) die "$1 requires a value; see ccsync help" ;; esac
+}
+
+valid_field() {
+    case $1 in *"	"*|*"
+"*|*"$(printf '\r')"*) return 1 ;; esac
+}
+
+configured_shares() {
+    {
+        [ -z "$SHARE" ] || printf '%s\n' "$SHARE"
+        if [ -f "$MAP" ]; then
+            awk -F '\t' '$1=="share" && $3=="enabled" && $4==1 {print $2}
+                         $1=="host" && $3=="share" {print $4}' "$MAP"
+        fi
+    } | CCSYNC_PATH_WINDOWS=$IS_WINDOWS awk "$PATH_AWK"'
+        !seen[pathkey($0,1)]++ {print}' | sort
+}
+
+filesystem_peers() ( # optional share; includes legacy inboxes
+    root=${1:-$SHARE}
+    for entry in "$root"/*; do
+        [ -d "$entry" ] && [ ! -L "$entry" ] || continue
+        name=${entry##*/}
+        safe_component "$name" || continue
+        printf '%s\n' "$name"
+    done
+)
+
+filesystem_peer() ( # resolve case to the receiver's published name
+    want=$1
+    filesystem_peers | awk -v want="$want" 'tolower($0)==tolower(want) {name=$0; n++} END {if(n==1) print name}'
+)
+
+register_inbox() ( # Only create our own inbox, never a destination's.
+    transport_ready
+    for name in $(filesystem_peers); do
+        if [ "$(printf '%s' "$name" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$FS_HOST" | tr 'A-Z' 'a-z')" ] && [ "$name" != "$FS_HOST" ]; then
+            die "endpoint name conflicts with '$name' on $SHARE; choose a distinct --host"
+        fi
+    done
+    inbox=$SHARE/$FS_HOST
+    [ ! -L "$inbox" ] || die "inbox is a symlink: $inbox"
+    mkdir -p "$inbox" || die "cannot create inbox $inbox; check share permissions"
+    # Persist an identity so another configuration cannot claim this name.
+    identity=$(map_get local endpoint_id)
+    if [ -z "$identity" ]; then
+        private_dir "$STATE"
+        unique=$(mktemp "$STATE/.endpoint.XXXXXXXXXX") || die "cannot create endpoint identity"
+        identity=${unique##*.}; rm -f "$unique"
+        map_set local endpoint_id "$identity" || die "cannot save endpoint identity"
+    fi
+    marker=$inbox/.ccsync-peer
+    if [ -e "$marker" ]; then
+        [ "$(cat "$marker")" = "$identity" ] || die "'$FS_HOST' is registered by another endpoint on $SHARE; choose a unique --host"
+    else
+        # noclobber prevents two first-time setups from claiming the same name.
+        (set -C; printf '%s\n' "$identity" > "$marker") 2>/dev/null || die "cannot register $inbox; check permissions or retry setup"
+    fi
+)
+
+saved_peer_name() {
+    map_hosts | awk -v want="$1" '
+        $0==want {exact=$0}
+        tolower($0)==tolower(want) {name=$0; n++}
+        END {if(exact!="") print exact; else if(n==1) print name}'
+}
+
+select_transport() { # peer; command flags > environment > saved peer > discovery/default
+    _lookup_peer=$(saved_peer_name "$1"); _lookup_peer=${_lookup_peer:-$1}
+    TRANSPORT=${OPT_TRANSPORT:-${CCSYNC_TRANSPORT:-$(map_get host "$_lookup_peer" transport)}}
+    SHARE=${OPT_SHARE:-${CCSYNC_SHARE:-$(map_get host "$_lookup_peer" share)}}
+    [ -z "$SHARE" ] || SHARE=$(abs_path "$SHARE")
+    if [ -z "$TRANSPORT" ]; then
+        # Existing pre-transport mappings are Taildrop mappings.
+        if [ -n "$(map_get host "$_lookup_peer" os)" ] || [ -n "$(map_remote_for "$_lookup_peer" "${_local:-$PWD}")" ]; then
+            TRANSPORT=tailscale
+            [ "$(map_get host "$_lookup_peer" os)" != filesystem ] || TRANSPORT=filesystem
+        else
+            SHARE=${SHARE:-$DEFAULT_SHARE}
+            _matches=$(configured_shares | while IFS= read -r root; do
+                (SHARE=$root; [ -z "$(filesystem_peer "$1")" ] || printf '%s\n' "$root")
+            done)
+            _count=$(printf '%s\n' "$_matches" | awk 'NF {n++} END {print n+0}')
+            [ "$_count" -le 1 ] || die "'$1' exists on multiple shares; select one with --share <dir>"
+            if [ "$_count" = 1 ]; then TRANSPORT=filesystem; SHARE=$_matches; fi
+        fi
+    fi
+    TRANSPORT=${TRANSPORT:-$DEFAULT_TRANSPORT}
+    SHARE=${SHARE:-$DEFAULT_SHARE}
+    transport_ready
+    if [ "$TRANSPORT" = filesystem ]; then
+        safe_component "$1" || die "invalid filesystem peer name: $1"
+        register_inbox || return 1
+        _hn=$(filesystem_peer "$1")
+        [ -n "$_hn" ] || die "no filesystem peer '$1' on $SHARE. Known peers: $(filesystem_peers | tr '\n' ' '). Run ccsync setup --share <dir> --host <name> on the receiver, then ccsync status here."
+        [ "$_hn" != "$FS_HOST" ] || die "'$1' is this endpoint; choose a different peer from ccsync status"
+        [ "$_hn" = "$1" ] || say "  using receiver's registered name: $_hn"
+    else
+        _hn=$(peer_field "$1" hostname)
+        [ -n "$_hn" ] || die "'$1' is not in this tailnet; check tailscale status, or use --share <dir> for a filesystem peer"
+    fi
+}
+
+remember_transport() ( # peer; temporary environment overrides do not replace an existing route
+    if [ -n "$(map_get host "$1" transport)" ] &&
+       [ -z "$OPT_TRANSPORT$OPT_SHARE" ] && [ -n "${CCSYNC_TRANSPORT:-}${CCSYNC_SHARE:-}" ]; then
+        return 0
+    fi
+    map_set host "$1" transport "$TRANSPORT" || return 1
+    if [ "$TRANSPORT" = filesystem ]; then
+        map_set host "$1" share "$SHARE"
+        map_set share "$SHARE" enabled 1
+    else
+        map_del host "$1" share
+    fi
+)
+
+remember_received_transport() (
+    [ "$RECEIVE_ROUTE" = 1 ] || return 0
+    OPT_TRANSPORT=$TRANSPORT
+    remember_transport "$1"
+)
+
+receive_routes() {
+    {
+        configured_shares | while IFS= read -r root; do
+            [ -z "$root" ] || printf 'filesystem\t%s\n' "$root"
+        done
+        if [ "$TRANSPORT" = tailscale ] || [ "$(map_get local tailscale)" = enabled ] ||
+           { [ -f "$MAP" ] && awk -F '\t' '
+               $1=="path" {peers[$2]=1}
+               $1=="host" && $3=="transport" {route[$2]=$4}
+               END {for(p in route) if(route[p]=="tailscale") exit 0
+                    for(p in peers) if(!(p in route)) exit 0; exit 1}' "$MAP"; }; then
+            printf 'tailscale\t-\n'
+        fi
+    } | sort -u
+}
+
+cmd_setup() {
+    setup_transport=; setup_share=; setup_host=; remove_share=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --share) need_value "$@"; setup_share=$2; shift 2 ;;
+            --host) need_value "$@"; setup_host=$2; shift 2 ;;
+            --transport) need_value "$@"; setup_transport=$2; shift 2 ;;
+            --remove-share) need_value "$@"; remove_share=$2; shift 2 ;;
+            *) die "unknown setup option: $1; see ccsync help" ;;
+        esac
+    done
+    if [ -n "$remove_share" ]; then
+        [ -z "$setup_transport$setup_share$setup_host" ] || die "use --remove-share on its own"
+        remove_share=$(abs_path "$remove_share")
+        if [ -f "$MAP" ] && awk -F '\t' -v s="$remove_share" '$1=="host" && $3=="share" && $4==s {found=1} END {exit !found}' "$MAP"; then
+            die "share is used by saved peers; run ccsync unmap <peer> for those peers first (see ccsync status)"
+        fi
+        map_del share "$remove_share"
+        if [ "$(map_get local share)" = "$remove_share" ]; then
+            map_del local share
+            map_set local transport tailscale
+        fi
+        say "removed share from configuration: $remove_share (files preserved)"
+        return
+    fi
+    [ -z "$setup_share" ] || setup_transport=${setup_transport:-filesystem}
+    TRANSPORT=${setup_transport:-$TRANSPORT}
+    case $TRANSPORT in tailscale|filesystem) ;; *) die "unknown transport: $TRANSPORT (use tailscale or filesystem)" ;; esac
+    if [ "$TRANSPORT" = filesystem ]; then
+        SHARE=$(abs_path "${setup_share:-$SHARE}")
+        FS_HOST=${setup_host:-$FS_HOST}
+        if [ -z "$FS_HOST" ]; then
+            FS_HOST=$(hostname | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9._-]/-/g')
+            if [ "$IS_WSL" = 1 ]; then
+                FS_HOST=$FS_HOST-$(printf '%s' "${WSL_DISTRO_NAME:-wsl}" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9._-]/-/g')
+            fi
+        fi
+        _old_host=$(map_get local host)
+        if [ -n "$_old_host" ] && [ "$_old_host" != "$FS_HOST" ]; then
+            die "endpoint name is already '$_old_host'; keep it stable or use a separate CLAUDE_CONFIG_DIR for a new endpoint"
+        fi
+        register_inbox || return 1
+        map_set local host "$FS_HOST"
+        map_set local share "$SHARE"
+        map_set share "$SHARE" enabled 1
+        say "registered endpoint: $FS_HOST"
+        say "shared directory: $SHARE"
+        say "inbox: $SHARE/$FS_HOST"
+    else
+        [ -z "$setup_share$setup_host" ] || die "--share and --host apply to filesystem transport"
+        transport_ready
+        map_set local tailscale enabled
+    fi
+    for peer in $(map_hosts); do
+        if [ -z "$(map_get host "$peer" transport)" ]; then
+            map_set host "$peer" transport "${CCSYNC_TRANSPORT:-$DEFAULT_TRANSPORT}"
+            if [ "${CCSYNC_TRANSPORT:-$DEFAULT_TRANSPORT}" = filesystem ]; then
+                map_set host "$peer" share "${CCSYNC_SHARE:-$DEFAULT_SHARE}"
+            fi
+        fi
+    done
+    map_set local transport "$TRANSPORT"
+    say "saved in $MAP; commands and automatic pulls use this configuration"
+    say "next: run ccsync setup on the other endpoint, then ccsync status and ccsync init <peer> <remote-dir>"
+    [ -z "${CCSYNC_TRANSPORT:-}${CCSYNC_SHARE:-}${CCSYNC_HOST:-}" ] || say "note: CCSYNC_* environment overrides are active; unset them to use only saved configuration"
 }
 
 # ------------------------------------------------------------------ tailnet
 # `tailscale status` lines look like:
-#   100.74.108.118  m4pro-hinaser  owner@  macOS  -
-#   100.97.175.41   chia           owner@  android  offline, last seen 124d ago
+#   100.64.0.1  desktop  user@  macOS  -
+#   100.64.0.2  laptop   user@  linux  offline, last seen 1d ago
 
 ts_status_cache=
 
@@ -254,10 +527,23 @@ ts_status() {
 }
 
 self_host() {
+    if [ "$TRANSPORT" = filesystem ]; then
+        printf '%s\n' "$FS_HOST"
+        return
+    fi
     ts_status | awk 'NF >= 2 && $1 ~ /^[0-9]+\./ { print $2; exit }'
 }
 
 peer_field() { # name field(hostname|ip|os|state)
+    if [ "$TRANSPORT" = filesystem ]; then
+        safe_component "$1" || return 1
+        case $2 in
+            hostname) printf '%s\n' "$1" ;;
+            state) [ -d "$SHARE/$1" ] && printf 'available\n' || printf 'unavailable\n' ;;
+            os) printf 'filesystem\n' ;;
+        esac
+        return
+    fi
     ts_status | awk -v want="$1" -v field="$2" '
         NF >= 2 && $1 ~ /^[0-9]+\./ {
             host = $2
@@ -274,6 +560,39 @@ peer_field() { # name field(hostname|ip|os|state)
 }
 
 # ------------------------------------------------------------------ staging
+
+transport_ready() {
+    case $TRANSPORT in
+        tailscale) find_tailscale ;;
+        filesystem)
+            valid_field "$SHARE" || die "share paths cannot contain tabs or newlines"
+            safe_component "$FS_HOST" || die "set a valid endpoint name with ccsync setup --share <dir> --host <name> (letters, digits, dot, underscore or hyphen)"
+            case $SHARE in
+                /*|[A-Za-z]:/*) ;;
+                *) die "configure a shared directory with ccsync setup --share <absolute-dir> --host <name>" ;;
+            esac
+            [ -d "$SHARE" ] || die "shared directory unavailable: $SHARE; mount it or check the path with ccsync status"
+            ;;
+        *) die "unknown transport: $TRANSPORT (use tailscale or filesystem)" ;;
+    esac
+}
+
+send_bundle() ( # bundle peer; subshell keeps caller variables intact
+    if [ "$TRANSPORT" = tailscale ]; then
+        ts file cp "$(arg_path "$1")" "$2:"
+        exit $?
+    fi
+    safe_component "$2" || exit 1
+    _inbox=$SHARE/$2
+    [ -d "$_inbox" ] && [ ! -L "$_inbox" ] || { warn "receiver inbox unavailable: $_inbox; run setup on the receiver"; exit 1; }
+    # Copy to a unique temporary name on the destination filesystem, then
+    # rename there. Interrupted copies never match list_bundles.
+    _pending=$(mktemp "$_inbox/.ccsync.XXXXXXXXXX") || exit 1
+    trap 'rm -f "$_pending"' EXIT HUP INT TERM
+    cp "$1" "$_pending" || exit 1
+    _name=$(basename "$1" .tar.gz)
+    mv "$_pending" "$_inbox/${_name}_${_pending##*.}.tar.gz"
+)
 
 win_temp_dir() {
     _c=/mnt/c/Windows/System32/cmd.exe
@@ -298,6 +617,9 @@ win_temp_dir() {
 }
 
 staging_dir() {
+    if [ "$TRANSPORT" = filesystem ]; then
+        private_dir "$OUTBOX"; printf '%s' "$OUTBOX"; return 0
+    fi
     find_tailscale
     if [ "$TS_CROSS" = 0 ]; then
         private_dir "$OUTBOX"; printf '%s' "$OUTBOX"; return 0
@@ -328,7 +650,8 @@ auto_accept_dirs() {
 # Transcripts are append-only, so comparing these tells us whether one copy is
 # a continuation of the other or whether the two have diverged.
 chain() { # file cwd
-    awk -v cwd="$2" '
+    CCSYNC_CHAIN_CWD=$(json_escape_path "$2") awk '
+        BEGIN {cwd=ENVIRON["CCSYNC_CHAIN_CWD"]}
         function repl(s, from, to,   out, p) {
             if (from == "") return s
             out = ""
@@ -370,32 +693,60 @@ common_prefix_len() { # a b
 }
 
 # JSON string escaping of a path: backslashes are doubled in the transcript.
-json_escape_path() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+json_escape_path() {
+    printf '%s' "$1" | awk 'BEGIN {ORS=""} {for(i=1;i<=length($0);i++) {
+        c=substr($0,i,1); if(c=="\\" || c=="\"") printf "\\"; printf "%s",c
+    }}'
+}
 
-rewrite_jsonl() { # src dst origin_cwd local_cwd rewrite_all -> prints "lines changed"
-    _eo=$(json_escape_path "$3"); _el=$(json_escape_path "$4")
-    awk -v from="$_eo" -v to="$_el" -v all="$5" -v out="$2" '
-        function repl(s, f, t,   o, p) {
-            if (f == "") return s
-            o = ""
-            while ((p = index(s, f)) > 0) {
-                o = o substr(s, 1, p - 1) t
-                s = substr(s, p + length(f))
-            }
+rewrite_jsonl() { # src dst origin_cwd local_cwd rewrite_all
+    CCSYNC_FROM=$3 CCSYNC_TO=$4 CCSYNC_OUT=$2 CCSYNC_ALL=$5 awk '
+        function escape(s,  i,c,r) {
+            r=""; for(i=1;i<=length(s);i++) {
+                c=substr(s,i,1); if(c=="\\" || c=="\"") r=r "\\"; r=r c
+            } return r
+        }
+        function decode(s,  i,c,r) {
+            r=""; for(i=1;i<=length(s);i++) {
+                c=substr(s,i,1)
+                if(c=="\\" && i<length(s)) {i++; c=substr(s,i,1)}
+                r=r c
+            } return r
+        }
+        function key(s) {
+            if(s ~ /^[A-Za-z]:/) {gsub(/\\/,"/",s); s=tolower(s)}
+            if(fromwin && s ~ /^\/[A-Za-z]\//) s=tolower(substr(s,2,1) ":" substr(s,3))
+            while(length(s)>1 && s ~ /\/$/ && s !~ /^[A-Za-z]:\/$/) s=substr(s,1,length(s)-1)
+            return s
+        }
+        function repl(s,f,t,  o,p) {
+            if(f=="") return s
+            o=""; while((p=index(s,f))>0) {o=o substr(s,1,p-1) t; s=substr(s,p+length(f))}
             return o s
         }
-        BEGIN { fk = "\"cwd\":\"" from "\""; tk = "\"cwd\":\"" to "\"" }
-        {
-            lines++
-            if (from == to) { print > out; next }
-            if (all == 1) {
-                if (index($0, from) > 0) { changed++; print repl($0, from, to) > out }
-                else print > out
-            } else if (index($0, fk) > 0) {
-                changed++; print repl($0, fk, tk) > out
-            } else print > out
+        BEGIN {
+            from=ENVIRON["CCSYNC_FROM"]; to=ENVIRON["CCSYNC_TO"]
+            fromwin=(from ~ /^[A-Za-z]:/); fk=key(from)
+            ef=escape(from); et=escape(to); out=ENVIRON["CCSYNC_OUT"]
         }
-        END { printf "%d %d\n", lines, changed }
+        {
+            lines++; original=$0; result=""; rest=$0
+            if(ENVIRON["CCSYNC_ALL"]==1) {
+                rest=repl(rest,ef,et)
+            } else {
+                while(match(rest,/"cwd"[ \t]*:[ \t]*"([^"\\]|\\.)*"/)) {
+                    prefix=substr(rest,1,RSTART-1); field=substr(rest,RSTART,RLENGTH)
+                    rest=substr(rest,RSTART+RLENGTH)
+                    match(field,/:[ \t]*"/); start=RSTART+RLENGTH
+                    value=substr(field,start,length(field)-start)
+                    if(key(decode(value))==fk) field=substr(field,1,start-1) et "\""
+                    result=result prefix field
+                }
+            }
+            result=result rest; if(result!=original) changed++
+            print result > out
+        }
+        END {printf "%d %d\n",lines,changed}
     ' "$1"
 }
 
@@ -444,58 +795,67 @@ mf_put() { printf '%s\t%s\n' "$1" "$2"; }
 
 usage() {
     cat <<'EOF'
-ccsync - move Claude Code sessions between machines over Tailscale
+ccsync - move Claude Code sessions between machines
 
+  ccsync setup --share <dir> [--host <name>]
+  ccsync setup --transport tailscale
+  ccsync setup --remove-share <dir>
   ccsync push [-r] [host[:<remote-dir>]] [--session <id>] [--no-history]
+              [--transport tailscale|filesystem] [--share <dir>]
   ccsync pull [<local-dir>] [--source <dir>] [--force]
              [--rewrite-all] [--quiet] [--auto]
   ccsync init <host> <remote-dir> [--local <dir>]
+              [--transport tailscale|filesystem] [--share <dir>]
   ccsync unmap <host> [<local-dir>]
   ccsync list [--limit N]
   ccsync status
   ccsync --version
 
-The receiving side needs no configuration: a pushed session carries the
-directory the sender mapped it to. Use ccsync pull <local-dir> to place it somewhere else.
+For a shared filesystem, run setup on both endpoints first. Status lists peers.
+Setup persists settings for commands and the SessionStart hook; no shell exports needed.
+A pushed session carries its destination. Use pull <local-dir> to place it elsewhere.
 Use -r to include the whole current project: ccsync push -r host:/path/to/project
-Push sends a Taildrop bundle; pull imports it on the receiving machine.
+Push sends a bundle; pull imports it on the receiving machine.
+Tailscale is the default. --share selects filesystem transport and remembers it
+for that peer; --transport tailscale selects Taildrop. Pull checks every configured inbox.
+Push precedence: command flags > CCSYNC_* environment > saved peer > default.
+CCSYNC_TRANSPORT, CCSYNC_SHARE and CCSYNC_HOST remain optional environment overrides.
 Pull accepts only a local destination, not host:/path. SessionStart runs pull automatically.
 EOF
 }
 
 cmd_init() {
-    _host=${1:-}; _remote=${2:-}
-    shift 2 2>/dev/null || true
-    _local=$PWD
+    _host=; _remote=; _local=$PWD
     while [ $# -gt 0 ]; do
         case $1 in
-            --local) _local=$2; shift 2 ;;
-            *) die "unexpected argument: $1" ;;
+            --local) need_value "$@"; _local=$2; shift 2 ;;
+            --transport) need_value "$@"; OPT_TRANSPORT=$2; shift 2 ;;
+            --share) need_value "$@"; OPT_SHARE=$(abs_path "$2"); shift 2 ;;
+            -*) die "unknown init option: $1" ;;
+            *) if [ -z "$_host" ]; then _host=$1
+               elif [ -z "$_remote" ]; then _remote=$1
+               else die "expected ccsync init <host> <remote-dir>"; fi
+               shift ;;
         esac
     done
-    [ -n "$_host" ] && [ -n "$_remote" ] || { usage; exit 1; }
+    [ -n "$_host" ] && [ -n "$_remote" ] || { usage; return 1; }
+    [ -z "$OPT_SHARE" ] || OPT_TRANSPORT=${OPT_TRANSPORT:-filesystem}
+    [ -z "$OPT_SHARE" ] || [ "$OPT_TRANSPORT" = filesystem ] || die "--share requires filesystem transport"
     _local=$(abs_path "$_local")
-    _remote=${_remote%/}
-    [ -n "$_remote" ] || _remote=/
-
-    find_tailscale
-    _hn=$(peer_field "$_host" hostname)
-    [ -n "$_hn" ] || die "'$_host' is not in this tailnet (check \`tailscale status\`)"
-    _ip=$(peer_field "$_host" ip); _os=$(peer_field "$_host" os); _st=$(peer_field "$_host" state)
-
-    say "ccsync $VERSION"
-    say "  local  : $(self_host)  $_local"
-    say "  remote : $_hn  $_ip  $_os  $_st"
-    say "  path   : $_remote"
-
+    _remote=$(normalize_path "$_remote")
+    select_transport "$_host" || return 1
+    _st=$(peer_field "$_hn" state)
     map_set path "$_hn" "$_local" "$_remote"
-    map_set host "$_hn" os "$_os"
-    say "  mapped : $_local -> $_hn:$_remote"
-
-    [ "$_st" = online ] || { say ""; say "  peer is offline; mapping saved. Bring it online and re-run to verify."; return 0; }
-
+    map_set host "$_hn" os "$(peer_field "$_hn" os)"
+    remember_transport "$_hn"
+    say "mapped $_local -> $_hn:$_remote [$TRANSPORT, $_st]"
+    if [ "$TRANSPORT" = tailscale ] && [ "$_st" != online ]; then
+        say "peer is offline; mapping saved. Bring it online and re-run init to verify."
+        return 0
+    fi
     _stg=$(staging_dir)
     _tmp=$(mktemp -d) || die "mktemp failed"
+    _probe_id=${_tmp##*/}
     {
         mf_put kind probe
         mf_put tool_version "$VERSION"
@@ -503,39 +863,38 @@ cmd_init() {
         mf_put origin_host "$(self_host)"
         mf_put origin_cwd "$_local"
         mf_put claimed_remote_cwd "$_remote"
+        mf_put target_host "$_hn"
+        mf_put probe_id "$_probe_id"
     } > "$_tmp/manifest"
-    _b=$_stg/probe_$(self_host)_$(date '+%s').tar.gz
-    ( cd "$_tmp" && tar -czf "$_b" manifest ) || die "could not build probe"
+    _b=$_stg/probe_$(self_host)_$(date '+%s')_$$.tar.gz
+    ( cd "$_tmp" && tar -czf "$(archive_path "$_b")" manifest ) || { rm -rf "$_tmp"; die "could not build probe"; }
     rm -rf "$_tmp"
-    ts file cp "$(arg_path "$_b")" "$_hn:" >/dev/null 2>&1 || { rm -f "$_b"; die "could not send probe to $_hn"; }
+    map_set host "$_hn" probe_id "$_probe_id"
+    if ! _err=$(send_bundle "$_b" "$_hn" 2>&1); then
+        rm -f "$_b"; die "$TRANSPORT probe to $_hn failed: $_err"
+    fi
     rm -f "$_b"
-    say ""
-    say "  probe sent -> $_hn"
-    say "  On $_hn, run: ccsync pull   (or just start Claude Code there)"
+    say "probe sent -> $_hn; run ccsync pull there, then here to receive its acknowledgement"
 }
 
-
 cmd_unmap() {
-    _host=${1:-}; _dir=${2:-}
-    [ -n "$_host" ] || { usage; exit 1; }
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: ccsync unmap <host> [<local-dir>]"
+    _host=$(saved_peer_name "$1"); _host=${_host:-$1}; _dir=${2:-}
     [ -f "$MAP" ] || die "no mappings recorded"
-
     if [ -n "$_dir" ]; then
-        _dir=$(abs_path "$_dir"); _dir=${_dir%/}
-        _gone=$(awk -F'\t' -v h="$_host" -v d="$_dir" \
-            '$1 == "path" && $2 == h && $3 == d { printf "  %s  ->  %s\n", $3, $4 }' "$MAP")
-        [ -n "$_gone" ] || die "$_host has no mapping for $_dir"
-        map_del path "$_host" "$_dir"
-        say "unmapped $_host:"
+        _dir=$(abs_path "$_dir")
+        _matched=$(CCSYNC_PATH_WINDOWS=$IS_WINDOWS CCSYNC_LOOKUP_PATH=$_dir awk -F '\t' -v h="$_host" "$PATH_AWK"'
+            $1=="path" && $2==h && pathkey($3,1)==pathkey(ENVIRON["CCSYNC_LOOKUP_PATH"],1) {print $3}' "$MAP")
+        [ -n "$_matched" ] || die "$_host has no mapping for $_dir"
+        printf '%s\n' "$_matched" | while IFS= read -r path; do map_del path "$_host" "$path"; done
+        say "unmapped $_host: $_dir"
     else
-        _gone=$(awk -F'\t' -v h="$_host" \
-            '$1 == "path" && $2 == h { printf "  %s  ->  %s\n", $3, $4 }' "$MAP")
-        [ -n "$_gone" ] || die "no mappings for $_host"
+        _found=$(awk -F '\t' -v h="$_host" '($1=="path" || $1=="host") && $2==h {print 1; exit}' "$MAP")
+        [ -n "$_found" ] || die "no saved peer named $_host; see ccsync status"
         map_del path "$_host"
         map_del host "$_host"
-        say "forgot $_host:"
+        say "forgot peer: $_host"
     fi
-    say "$_gone"
 }
 
 # Copy a selected project path into staging. Subshells keep recursive variables
@@ -611,7 +970,9 @@ cmd_push() {
     _host=; _to=; _sess=; _nohist=0; _recursive=0
     while [ $# -gt 0 ]; do
         case $1 in
-            --session) _sess=$2; shift 2 ;;
+            --session) need_value "$@"; _sess=$2; shift 2 ;;
+            --transport) need_value "$@"; OPT_TRANSPORT=$2; shift 2 ;;
+            --share) need_value "$@"; OPT_SHARE=$(abs_path "$2"); shift 2 ;;
             --no-history) _nohist=1; shift ;;
             -r) _recursive=1; shift ;;
             -*) die "unknown option: $1" ;;
@@ -628,7 +989,6 @@ cmd_push() {
     esac
 
     _local=$(abs_path "$PWD")
-    find_tailscale
 
     if [ -z "$_host" ]; then
         _n=0
@@ -638,11 +998,12 @@ cmd_push() {
         [ "$_n" = 1 ] || die "name the destination: ccsync push host:/remote-dir"
     fi
 
-    _hn=$(peer_field "$_host" hostname)
-    [ -n "$_hn" ] || die "'$_host' is not in this tailnet"
+    [ -z "$OPT_SHARE" ] || OPT_TRANSPORT=${OPT_TRANSPORT:-filesystem}
+    [ -z "$OPT_SHARE" ] || [ "$OPT_TRANSPORT" = filesystem ] || die "--share requires filesystem transport"
+    select_transport "$_host" || return 1
 
     if [ -n "$_to" ]; then
-        _to=${_to%/}; [ -n "$_to" ] || _to=/
+        _to=$(normalize_path "$_to")
         map_set path "$_hn" "$_local" "$_to"
         _remote=$_to
     else
@@ -650,8 +1011,9 @@ cmd_push() {
         [ -n "$_remote" ] || die "no directory mapped for $_local on $_hn. Use $_hn:/remote-dir (recorded for next time)."
     fi
 
-    [ "$(peer_field "$_host" state)" = online ] || \
-        die "$_hn is offline. Taildrop delivers directly and does not queue - bring the peer online and re-run."
+    if [ "$TRANSPORT" = tailscale ] && [ "$(peer_field "$_hn" state)" != online ]; then
+        die "$_hn is offline. Taildrop delivers directly and does not queue; bring the peer online and re-run."
+    fi
 
     if [ -n "$_sess" ]; then
         case $_sess in
@@ -664,6 +1026,7 @@ cmd_push() {
     [ -f "$_src" ] || die "session file not found: $_src"
 
     _sid=$(session_id_of "$_src")
+    safe_component "$_sid" || die "unusable session id: $_sid"
     _lines=$(wc -l < "$_src" | tr -d ' ')
     _sha=$(sha256_of "$_src")
     _branch=$(command -v git >/dev/null 2>&1 && git -C "$_local" rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -682,7 +1045,7 @@ cmd_push() {
         mf_put tool_version "$VERSION"
         mf_put created_at "$(now_iso)"
         mf_put origin_host "$(self_host)"
-        mf_put origin_cwd "$_local"
+        mf_put origin_cwd "$(transcript_cwd "$_local")"
         mf_put target_cwd "$_remote"
         mf_put session_id "$_sid"
         mf_put line_count "$_lines"
@@ -712,17 +1075,18 @@ cmd_push() {
     }
 
     _stg=$(staging_dir)
-    _b=$_stg/sess_${_sid}_$(self_host)_$(date '+%s').tar.gz
-    ( cd "$_tmp" && tar -czf "$_b" . ) || die "could not build bundle"
+    _b=$_stg/sess_${_sid}_$(self_host)_$(date '+%s')_$$.tar.gz
+    ( cd "$_tmp" && tar -czf "$(archive_path "$_b")" . ) || die "could not build bundle"
     rm -rf "$_tmp"
     _kb=$(du -k "$_b" | awk '{print $1}')
     [ "$_kb" -le "$MAX_BUNDLE_KB" ] || {
         rm -f "$_b"; die "bundle exceeds the ${MAX_BUNDLE_KB} KB transfer limit; reduce the project size or omit -r"
     }
-    if ! ts file cp "$(arg_path "$_b")" "$_hn:" >/dev/null 2>&1; then
-        rm -f "$_b"; die "Taildrop transfer to $_hn failed"
+    if ! _err=$(send_bundle "$_b" "$_hn" 2>&1); then
+        rm -f "$_b"; die "$TRANSPORT transfer to $_hn failed: $_err"
     fi
     rm -f "$_b"
+    remember_transport "$_hn"
     say "pushed $_sid ($_lines lines, ${_kb} KB) -> $_hn:$_remote"
     [ "$_recursive" = 0 ] || say "  includes project files (receiver must run a version supporting project transfer)"
     say "  on $_hn: ccsync pull   then   claude --resume $_sid"
@@ -732,7 +1096,7 @@ cmd_pull() {
     _into=; _source=; _force=0; _all=0
     while [ $# -gt 0 ]; do
         case $1 in
-            --source) _source=$2; shift 2 ;;
+            --source) need_value "$@"; _source=$(abs_path "$2"); shift 2 ;;
             --force) _force=1; shift ;;
             --rewrite-all) _all=1; shift ;;
             --quiet) QUIET=1; shift ;;
@@ -742,32 +1106,65 @@ cmd_pull() {
                _into=$1; shift ;;
         esac
     done
-
     case $_into in
         [A-Za-z]:/*|[A-Za-z]:\\*|/*|./*|../*) ;;
         *:*) die "pull accepts a local directory, not a remote source; run push on the sending machine first" ;;
     esac
-
+    [ -z "$_into" ] || _into=$(abs_path "$_into")
     private_dir "$STATE"; private_dir "$ARCHIVE"
     if [ -n "$_source" ]; then
-        _stg=$_source
+        [ -d "$_source" ] || die "source directory unavailable: $_source"
+        import_inbox "$_source"
+        return $?
+    fi
+    case $TRANSPORT in tailscale|filesystem) ;; *) die "unknown transport: $TRANSPORT" ;; esac
+    # Each route runs separately: failures and probe replies must not change the
+    # context of another inbox, and paths with spaces remain single records.
+    _routes=$(receive_routes)
+    [ -n "$_routes" ] || die "no receiving transports configured; run ccsync setup --share <dir> --host <name> or ccsync setup --transport tailscale"
+    _pull_failed=0
+    while IFS="$(printf '\t')" read -r route root; do
+        [ -n "$route" ] || continue
+        (TRANSPORT=$route; SHARE=$root; RECEIVE_ROUTE=1; pull_transport) || _pull_failed=1
+    done <<EOF_ROUTES
+$_routes
+EOF_ROUTES
+    [ "$AUTO" = 1 ] && return 0
+    return "$_pull_failed"
+}
+
+pull_transport() {
+    # Missing mounts or a stopped daemon must not emit hook errors every time
+    # Claude Code starts, nor keep another configured route from being drained.
+    if ! _ready_error=$(transport_ready 2>&1); then
+        [ "$AUTO" = 1 ] || warn "$_ready_error"
+        return 1
+    fi
+    if [ "$TRANSPORT" = filesystem ]; then
+        if ! _ready_error=$(register_inbox 2>&1); then
+            [ "$AUTO" = 1 ] || warn "$_ready_error"
+            return 1
+        fi
+        import_inbox "$SHARE/$FS_HOST"
     else
         _stg=$(staging_dir)
+        _fetch_failed=0
         _err=$(ts file get --conflict=rename "$(arg_path "$_stg")" 2>&1) || {
-            [ "$QUIET" = 1 ] || warn "ccsync: taildrop fetch failed: ${_err:-unknown error}"
+            [ "$AUTO" = 1 ] || warn "ccsync: Taildrop receive failed: ${_err:-unknown error}; check tailscale status"
+            _fetch_failed=1
         }
-    fi
-
-    _list=$(list_bundles "$_stg")
-    if [ -z "$_list" ] && [ -z "$_source" ]; then
-        for d in $(auto_accept_dirs); do
-            [ -d "$d" ] || continue
-            _list=$(list_bundles "$d")
-            [ -n "$_list" ] && { _stg=$d; say "  (found in $d)"; break; }
+        import_inbox "$_stg"
+        auto_accept_dirs | while IFS= read -r d; do
+            [ "$d" = "$_stg" ] || import_inbox "$d"
         done
+        return "$_fetch_failed"
     fi
-    [ -n "$_list" ] || { say "nothing to pull"; return 0; }
+}
 
+import_inbox() (
+    _stg=$1
+    _list=$(list_bundles "$_stg")
+    [ -n "$_list" ] || { say "nothing waiting in $_stg"; return 0; }
     _deferred=0; _conflicted=0
     printf '%s\n' "$_list" | while IFS= read -r b; do
         [ -n "$b" ] || continue
@@ -779,17 +1176,17 @@ cmd_pull() {
         _w=$(mktemp -d) || die "mktemp failed"
         # Check paths and entry types before extraction: project payloads must
         # not introduce traversal, symbolic links, hard links or devices.
-        if ! tar -tzf "$b" > "$_w/.members" 2>/dev/null ||
+        if ! tar -tzf "$(archive_path "$b")" > "$_w/.members" 2>/dev/null ||
            ! awk '/^\// || /\\/ || /^[A-Za-z]:/ { bad=1 }
                   { n=split($0,a,"/"); for(i=1;i<=n;i++) if(a[i]=="..") bad=1 }
                   END { exit bad }' "$_w/.members" ||
-           ! tar -tvzf "$b" > "$_w/.types" 2>/dev/null ||
+           ! tar -tvzf "$(archive_path "$b")" > "$_w/.types" 2>/dev/null ||
            ! awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" { bad=1 }
                   END { exit bad }' "$_w/.types"; then
             warn "  reject $(basename "$b"): unsafe archive paths or unsupported entry types"
             rm -rf "$_w"; reject_bundle "$b"; continue
         fi
-        if ! tar -xzf "$b" -C "$_w" 2>/dev/null; then
+        if ! tar -xzf "$(archive_path "$b")" -C "$_w" 2>/dev/null; then
             warn "  reject $(basename "$b"): not a readable bundle"
             rm -rf "$_w"; reject_bundle "$b"; continue
         fi
@@ -825,7 +1222,7 @@ cmd_pull() {
         esac
     done
     return 0
-}
+)
 
 # A bundle we will never be able to read. Move it out of the inbox so the
 # SessionStart hook does not retry it on every session for the rest of time.
@@ -842,26 +1239,35 @@ list_bundles() {
     done | sort
 }
 
-handle_probe() {
+handle_probe() (
     _mf=$1
     _origin=$(mf_get "$_mf" origin_host)
-    _claimed=$(mf_get "$_mf" claimed_remote_cwd)
+    _claimed=$(abs_path "$(mf_get "$_mf" claimed_remote_cwd)")
     _theirs=$(mf_get "$_mf" origin_cwd)
     safe_component "$_origin" || { warn "  skip probe: unusable origin host"; return 1; }
     _exists=no; [ -d "$_claimed" ] && _exists=yes
 
+    remember_received_transport "$_origin"
     map_set path "$_origin" "$_claimed" "$_theirs"
     map_set host "$_origin" verified "$(now_iso)"
 
     say "probe from $_origin"
     say "  $_origin:$_theirs  <->  $_claimed  ($( [ "$_exists" = yes ] && echo exists || echo 'MISSING on this machine'))"
 
-    find_tailscale
-    if [ "$(peer_field "$_origin" state)" = online ]; then
+    if [ "$RECEIVE_ROUTE" != 1 ]; then
+        _local=$_claimed
+        if ! select_transport "$_origin"; then
+            say "  reverse mapping saved; ack not sent (configure a return transport with init)"
+            return 0
+        fi
+    fi
+    if [ "$TRANSPORT" = filesystem ] || [ "$(peer_field "$_origin" state)" = online ]; then
         _stg=$(staging_dir)
-        _t=$(mktemp -d)
+        _t=$(mktemp -d) || { warn "  cannot stage acknowledgement"; return 1; }
         {
             mf_put kind ack
+            mf_put requested_host "$(mf_get "$_mf" target_host)"
+            mf_put probe_id "$(mf_get "$_mf" probe_id)"
             mf_put tool_version "$VERSION"
             mf_put created_at "$(now_iso)"
             mf_put origin_host "$(self_host)"
@@ -870,32 +1276,63 @@ handle_probe() {
             mf_put path_exists "$_exists"
             mf_put claude_version "$(claude --version 2>/dev/null | awk '{print $1; exit}')"
         } > "$_t/manifest"
-        _b=$_stg/ack_$(self_host)_$(date '+%s').tar.gz
-        ( cd "$_t" && tar -czf "$_b" manifest )
+        _b=$_stg/ack_$(self_host)_$(date '+%s')_$$.tar.gz
+        ( cd "$_t" && tar -czf "$(archive_path "$_b")" manifest ) || {
+            rm -rf "$_t"; rm -f "$_b"; warn "  could not build acknowledgement"; return 1;
+        }
         rm -rf "$_t"
-        ts file cp "$(arg_path "$_b")" "$(peer_field "$_origin" hostname):" >/dev/null 2>&1 \
-            && say "  ack sent -> $_origin"
+        if _err=$(send_bundle "$_b" "$_origin" 2>&1); then
+            say "  ack sent -> $_origin"
+        else
+            [ "$AUTO" = 1 ] || warn "  $TRANSPORT acknowledgement to $_origin failed: $_err; re-run init to retry verification"
+        fi
         rm -f "$_b"
     else
         say "  $_origin offline; ack not sent"
     fi
     [ "$_exists" = yes ] || say "  fix: create $_claimed here, or re-run init on $_origin with the right path"
     return 0
-}
+)
 
-handle_ack() {
+handle_ack() (
     _mf=$1
     _host=$(mf_get "$_mf" origin_host)
     safe_component "$_host" || { warn "  skip ack: unusable origin host"; return 1; }
+    _requested=$(mf_get "$_mf" requested_host)
+    _probe=$(mf_get "$_mf" probe_id)
+    if [ -n "$_requested$_probe" ]; then
+        safe_component "$_requested" && safe_component "$_probe" || { warn "  skip ack: invalid probe identity"; return 1; }
+        [ "$(map_get host "$_requested" probe_id)" = "$_probe" ] || {
+            say "  ignored old or unsolicited acknowledgement from $_host"; return 0;
+        }
+        if [ "$_requested" != "$_host" ]; then
+            # Only a reply to our pending probe may correct an alias. Other
+            # mappings on the confirmed host are retained.
+            awk -F '\t' -v h="$_requested" '$1=="path" && $2==h {print $3 "\t" $4}' "$MAP" |
+                while IFS="$(printf '\t')" read -r local_dir remote_dir; do
+                    map_set path "$_host" "$local_dir" "$remote_dir"
+                done
+            for field in transport share os; do
+                value=$(map_get host "$_requested" "$field")
+                [ -z "$value" ] || map_set host "$_host" "$field" "$value"
+            done
+            map_del path "$_requested"
+            map_del host "$_requested"
+            say "  peer name confirmed: $_requested -> $_host (saved mappings updated)"
+        fi
+        map_del host "$_host" probe_id
+    fi
+    remember_received_transport "$_host"
     map_set host "$_host" verified "$(now_iso)"
+    map_set host "$_host" path_exists "$(mf_get "$_mf" path_exists)"
     map_set host "$_host" claude_version "$(mf_get "$_mf" claude_version)"
     if [ "$(mf_get "$_mf" path_exists)" = yes ]; then _m=OK; else _m="PATH MISSING"; fi
     say "ack from $_host: $_m  ($(mf_get "$_mf" peer_cwd) <-> $(mf_get "$_mf" origin_cwd))"
     say "  remote Claude Code: $(mf_get "$_mf" claude_version)"
     return 0
-}
+)
 
-handle_session() {
+handle_session() (
     _mf=$1; _w=$2; _into=$3; _force=$4; _all=$5
     _sid=$(mf_get "$_mf" session_id)
     _origin=$(mf_get "$_mf" origin_host)
@@ -914,11 +1351,12 @@ handle_session() {
     else
         _local=$(map_local_for "$_origin" "$_ocwd")
         if [ -z "$_local" ] && [ -n "$_target" ] && [ -d "$_target" ]; then
-            _local=$_target
+            _local=$(abs_path "$_target")
             map_set path "$_origin" "$_local" "$_ocwd"
             say "  mapped $_origin:$_ocwd -> $_local (as the sender specified)"
         fi
     fi
+    [ -z "$_local" ] || _local=$(abs_path "$_local")
     if [ -z "$_local" ]; then
         [ "$QUIET" = 1 ] || {
             warn "  skip $_sid: no local directory for $_origin:$_ocwd"
@@ -944,12 +1382,13 @@ handle_session() {
         [ -z "$_got" ] || [ "$_got" = "$_want" ] || { warn "  skip $_sid: checksum mismatch"; return 1; }
     fi
 
+    remember_received_transport "$_origin"
     _dd=$(project_dir "$_local")
     _dest=$_dd/$_sid.jsonl
 
     if [ -f "$_dest" ]; then
         _lt=$_w/.local_tokens; _it=$_w/.incoming_tokens
-        chain "$_dest" "$_local" > "$_lt"
+        chain "$_dest" "$(transcript_cwd "$_local")" > "$_lt"
         chain "$_src" "$_ocwd" > "$_it"
         _rel=$(compare_chains "$_lt" "$_it")
         case $_rel in
@@ -985,7 +1424,7 @@ handle_session() {
     # Build beside the destination and rename over it, so a failure part-way
     # through cannot leave a truncated transcript where a whole one was.
     _new=$_dd/.$_sid.jsonl.new.$$
-    _counts=$(rewrite_jsonl "$_src" "$_new" "$_ocwd" "$_local" "$_all") || {
+    _counts=$(rewrite_jsonl "$_src" "$_new" "$_ocwd" "$(transcript_cwd "$_local")" "$_all") || {
         rm -f "$_new"; warn "  skip $_sid: could not write transcript"; return 1
     }
     mv "$_new" "$_dest" || { rm -f "$_new"; warn "  skip $_sid: could not place transcript"; return 1; }
@@ -1015,13 +1454,13 @@ handle_session() {
         printf '  note: Claude Code %s (origin) vs %s (here)\n' "$_tv" "$_mv"
     printf '  resume:  cd %s && claude --resume %s\n' "$_local" "$_sid"
     return 0
-}
+)
 
 cmd_list() {
     _limit=20
     while [ $# -gt 0 ]; do
         case $1 in
-            --limit) _limit=$2; shift 2 ;;
+            --limit) need_value "$@"; _limit=$2; shift 2 ;;
             *) die "unknown option: $1" ;;
         esac
     done
@@ -1040,29 +1479,102 @@ cmd_list() {
     done
 }
 
+bundle_count() { list_bundles "$1" | awk 'END {print NR+0}'; }
+
 cmd_status() {
-    find_tailscale
+    [ "$#" = 0 ] || die "status takes no arguments"
+    case $TRANSPORT in tailscale|filesystem) ;; *) die "unknown transport: $TRANSPORT" ;; esac
+    if [ "$TRANSPORT" = filesystem ] || [ -n "$(configured_shares)" ]; then
+        safe_component "$FS_HOST" || die "configure an endpoint name: ccsync setup --share <dir> --host <name>"
+    fi
     _cwd=$(abs_path "$PWD")
-    say "ccsync $VERSION   tailscale: $TS_BIN"
-    say "self: $(self_host)   cwd: $_cwd"
-    _hosts=$(map_hosts)
-    [ -n "$_hosts" ] || { say "no peers configured. ccsync push <host>:/remote-dir"; return 0; }
-    for h in $_hosts; do
-        _v=$(map_get host "$h" verified); [ -n "$_v" ] || _v=unverified
-        say ""
-        say "$h  [$(peer_field "$h" state)]  verified: $_v"
-        awk -F'\t' -v h="$h" -v cur="$_cwd" '
-            $1 == "path" && $2 == h {
-                printf " %s %s  ->  %s\n", ($3 == cur ? "*" : " "), $3, $4
-            }' "$MAP"
+    say "ccsync $VERSION   default transport: $TRANSPORT"
+    if [ -f "$MAP" ]; then say "configuration: $MAP"; else say "configuration: built-in defaults (no saved setup)"; fi
+    [ -z "${CCSYNC_TRANSPORT:-}" ] || say "environment override: CCSYNC_TRANSPORT=$CCSYNC_TRANSPORT"
+    [ -z "${CCSYNC_SHARE:-}" ] || say "environment override: CCSYNC_SHARE=$CCSYNC_SHARE"
+    [ -z "${CCSYNC_HOST:-}" ] || say "environment override: CCSYNC_HOST=$CCSYNC_HOST"
+    say "cwd: $_cwd"
+    say "transports and inboxes:"
+    receive_routes | while IFS="$(printf '\t')" read -r route root; do
+        (
+            TRANSPORT=$route; SHARE=$root
+            if [ "$route" = filesystem ]; then
+                say "  filesystem: $root   self: $FS_HOST"
+                if [ ! -d "$root" ]; then
+                    say "    unavailable; mount the share or correct it with ccsync setup --share <dir>"
+                else
+                    say "    inbox: $(bundle_count "$root/$FS_HOST") waiting for $FS_HOST"
+                    _peers=$(filesystem_peers)
+                    if [ -z "$_peers" ]; then
+                        say "    no registered endpoints; run ccsync setup on both endpoints"
+                    else
+                        for name in $_peers; do
+                            [ "$name" != "$FS_HOST" ] || continue
+                            say "    discovered: $name   $(bundle_count "$root/$name") waiting for import"
+                        done
+                    fi
+                    if [ ! -d "$root/$FS_HOST" ]; then
+                        say "    local inbox missing; run ccsync setup --share <dir> --host $FS_HOST"
+                    elif [ ! -w "$root/$FS_HOST" ]; then
+                        say "    local inbox is not writable; check share permissions"
+                    fi
+                fi
+            elif _error=$(transport_ready 2>&1); then
+                find_tailscale
+                if _tail_status=$(ts status 2>&1); then
+                    ts_status_cache=$_tail_status
+                    say "  tailscale: $TS_BIN   self: $(self_host)"
+                    say "    pending Taildrop delivery: managed by Tailscale; run ccsync pull to fetch"
+                    ts_status | awk -v self="$(self_host)" '
+                        NF>=2 && $1 ~ /^[0-9]+\./ && $2!=self {
+                            state="online"; for(i=3;i<=NF;i++) if(tolower($i) ~ /^offline/) state="offline"
+                            printf "    discovered: %s [%s] %s\n",$2,state,$1
+                        }'
+                    say "    local staging: $(bundle_count "$OUTBOX") bundles"
+                else
+                    say "  tailscale: unavailable; $_tail_status; check the Tailscale service"
+                fi
+            else
+                say "  tailscale: unavailable; $_error"
+            fi
+        )
     done
+    _hosts=$(map_hosts)
+    if [ -z "$_hosts" ]; then
+        say "no saved peers. Pair a discovered name: ccsync init <peer> <remote-dir>"
+        return 0
+    fi
+    say "saved peers (push uses flags > environment > saved peer > default):"
+    for h in $_hosts; do
+        (
+            TRANSPORT=${CCSYNC_TRANSPORT:-$(map_get host "$h" transport)}
+            TRANSPORT=${TRANSPORT:-tailscale}
+            SHARE=${CCSYNC_SHARE:-$(map_get host "$h" share)}
+            SHARE=${SHARE:-$DEFAULT_SHARE}
+            _v=$(map_get host "$h" verified); [ -n "$_v" ] || _v=unverified
+            if [ "$TRANSPORT" = filesystem ]; then
+                _state=unavailable; [ ! -d "$SHARE/$h" ] || _state='inbox available'
+                say "  $h [$TRANSPORT, $_state] share: $SHARE; verified: $_v"
+            else
+                say "  $h [tailscale] verified: $_v"
+            fi
+            [ "$(map_get host "$h" path_exists)" != no ] || say "    destination path missing on receiver; correct init's remote directory"
+            CCSYNC_PATH_WINDOWS=$IS_WINDOWS CCSYNC_LOOKUP_PATH=$_cwd awk -F '\t' -v h="$h" "$PATH_AWK"'
+                $1=="path" && $2==h {
+                    printf "   %s %s -> %s\n", (pathkey($3,1)==pathkey(ENVIRON["CCSYNC_LOOKUP_PATH"],1)?"*":" "),$3,$4
+                }' "$MAP"
+        )
+    done
+    say "filesystem availability means the inbox exists, not that the receiver is running"
 }
 
 # --------------------------------------------------------------------- main
 
 [ $# -gt 0 ] || { usage; exit 1; }
 _cmd=$1; shift
+load_config
 case $_cmd in
+    setup)  cmd_setup "$@" ;;
     init)   cmd_init "$@" ;;
     unmap)  cmd_unmap "$@" ;;
     push)   cmd_push "$@" ;;

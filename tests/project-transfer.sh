@@ -7,7 +7,7 @@ mkdir -p "$WORK/send" "$WORK/receive" "$WORK/inbox" "$WORK/source/src/empty" "$W
 cat > "$WORK/tailscale" <<'EOF'
 #!/bin/sh
 case $1 in
-    status) printf '100.0.0.1 sender user linux -\n100.0.0.2 receiver user linux -\n' ;;
+    status) printf '100.64.0.1 sender user linux -\n100.64.0.2 receiver user linux -\n' ;;
     file) [ "$2" != cp ] || cp "$3" "$INBOX/" ;;
 esac
 EOF

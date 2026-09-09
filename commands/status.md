@@ -1,5 +1,5 @@
 ---
-description: Show ccsync peers and directory mappings
+description: Show configuration, discovered peers, transport availability, queues and directory mappings
 allowed-tools: Bash
 ---
 

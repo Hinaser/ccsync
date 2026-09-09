@@ -1,15 +1,15 @@
 # ccsync
 
 A Claude Code plugin that moves session transcripts between machines over
-Tailscale (Taildrop). `bin/ccsync` is the whole implementation.
+Tailscale (Taildrop) or a shared filesystem. `bin/ccsync` is the whole implementation.
 
 Push sends to `host:/path`; `-r` includes the whole current project. Pull runs
 on the receiving machine and accepts only an optional local destination.
-It imports waiting Taildrop bundles; it does not fetch from a remote host.
+It imports waiting bundles; it does not fetch from a remote host.
 
 ## Constraints that are easy to break
 
-**Dependencies are sh, awk, tar and the Tailscale CLI. Nothing else.** No
+**Dependencies are POSIX utilities (sh, awk, tar, etc.) and, for Taildrop only, the Tailscale CLI.** No
 Python, no Node, no jq. This is deliberate: Git Bash on Windows and a stock
 macOS have no Python, and the tool has to run wherever Claude Code runs. The
 implementation was Python once and was rewritten for exactly this reason — do
@@ -42,7 +42,7 @@ an explicit local destination, a recorded mapping, or the `target_cwd` the sende
 — in that order. Scanning `$HOME` for a plausible directory was tried and
 removed.
 
-**Tailnet peers are trusted; their manifests still get checked.** A device that
+**Tailnet peers and shared-directory writers are trusted; manifests still get checked.** A device that
 Tailscale has approved into the tailnet is one of your own machines, so ccsync
 does not authenticate `origin_host` or verify that an incoming transcript's
 history is unmodified — a peer can assert both. What it does check is that
@@ -59,7 +59,7 @@ the same check.
 |---|---|
 | install id | `ccsync@hinaser` |
 | marketplace name | `hinaser`, from `.claude-plugin/marketplace.json` |
-| slash commands | `/ccsync:push`, `/ccsync:pull`, `/ccsync:status`, `/ccsync:list`, `/ccsync:init`, `/ccsync:unmap` — one file per subcommand in `commands/`, since plugin commands are namespaced as `<plugin>:<command>` |
+| slash commands | `/ccsync:push`, `/ccsync:pull`, `/ccsync:status`, `/ccsync:list`, `/ccsync:setup`, `/ccsync:init`, `/ccsync:unmap` — one file per subcommand in `commands/`, since plugin commands are namespaced as `<plugin>:<command>` |
 | state directory | `~/.claude/ccsync/` — no `claude-` prefix inside `~/.claude` |
 
 ## Releasing
@@ -67,12 +67,17 @@ the same check.
 1. bump `version` in `.claude-plugin/plugin.json` — the only place a version
    lives; it decides the install cache path and `bin/ccsync` reads it for
    `tool_version`
-2. update `RELEASE_NOTES.md`, run `sh tests/project-transfer.sh` and
-   `sh -n bin/ccsync`, then commit
-3. `git tag -a vX.Y.Z -m "ccsync X.Y.Z" && git push origin vX.Y.Z`
+2. update `RELEASE_NOTES.md`, run every `tests/*.sh` script and
+   `sh -n bin/ccsync`, then commit using the GitHub noreply identity
+3. create an annotated tag using the GitHub noreply identity, then push the
+   release commit to `main` and the tag to origin (the marketplace follows `main`)
 4. `gh release create vX.Y.Z --notes-file RELEASE_NOTES.md`
 5. refresh this machine's own install: `claude plugin marketplace update hinaser`
    then `claude plugin update ccsync@hinaser`, then restart
+
+Check release files and commit/tag metadata for private information before
+publishing. Keep account handles, but use generic example paths, hostnames and
+addresses. Do not rewrite published history as part of an ordinary release.
 
 Releases carry no assets; a plugin is installed from the repository, not
 downloaded. Do not force-update a tag that has been published.
@@ -103,3 +108,21 @@ the isolated sender/receiver integration tests.
 Tailscale runs on the Windows side and is driven through interop, so bundles
 are staged under `%LOCALAPPDATA%\Temp\ccsync` — the Windows binary cannot read
 WSL paths. Do not install Tailscale inside WSL.
+
+## Transport configuration
+
+`setup --share <dir> --host <name>` persists configuration as tab-separated
+`local` and `share` records in the existing map. `host` records store per-peer
+transport and share paths. Flags override environment, which overrides saved
+peer routes, then local defaults. `CCSYNC_*` variables remain supported.
+Both endpoints register their own inbox before sending; never silently create a
+peer inbox. Keep stable endpoint identities, peer validation and atomic bundle
+publication intact. Pull checks all configured routes with isolated contexts and
+suppresses unavailable transports in automatic hooks. Incoming paths and
+transcripts use platform-aware normalization; preserve native Windows cwd values.
+
+Run `sh tests/project-transfer.sh`, `sh tests/filesystem-transport.sh`,
+`sh tests/configuration.sh`, `sh tests/paths-and-pairing.sh`, and `sh -n bin/ccsync`.
+The path tests cover Windows representations without pretending to exercise SMB.
+`sh tests/wsl-host.sh` additionally exercises a real WSL/Windows round trip when
+Windows Git Bash is available, and skips elsewhere.

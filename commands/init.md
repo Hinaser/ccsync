@@ -1,6 +1,6 @@
 ---
 description: Pair a machine and verify the directory mapping
-argument-hint: <host> <remote-dir>
+argument-hint: <host> <remote-dir> [--local <dir>] [--transport tailscale|filesystem] [--share <dir>]
 allowed-tools: Bash
 ---
 
